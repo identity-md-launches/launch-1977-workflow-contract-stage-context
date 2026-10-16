@@ -25,9 +25,11 @@ contract SequenceHandler is Test {
 
     // Ghost totals the invariants are checked against.
     uint256 public ethIn; // buys + donations + forced ETH
-    uint256 public ethOut; // redemptions
+    uint256 public ethOut; // redemptions and escrow withdrawals
     uint256 public tokensSold; // base units sold by the vault
     uint256 public tokensRedeemed; // base units bought back
+    uint256 public tokensForced; // base units whose credit a forced redemption ended; the holder keeps them
+    uint256 public forced; // forced redemptions that cleared at least one holder
     uint256 public inventoryIn; // deposited
     uint256 public inventoryOut; // withdrawn by the owner
     uint256 public floorHighWater; // highest floor seen in the current epoch; 0 between epochs
@@ -194,6 +196,19 @@ contract SequenceHandler is Test {
             vault.sell(amount, 0);
             return;
         }
+        uint256 remainingCredit = credit - amount;
+        uint256 minCredit = vault.minRemainingCredit();
+        if (remainingCredit != 0 && remainingCredit < minCredit) {
+            // Leaving dust behind is refused whatever the caller holds; a whole exit never is.
+            probes++;
+            vm.prank(who);
+            vm.expectRevert(
+                abi.encodeWithSelector(RisingFloorVault.PositionTooSmall.selector, remainingCredit, minCredit)
+            );
+            vault.sell(amount, 0);
+            assertEq(vault.redeemable(who), credit, "sell: refused dust changed the credit");
+            return;
+        }
         if (amount > balance) {
             // Credit without the tokens: the pull fails after every check passed, and nothing moved.
             probes++;
@@ -267,6 +282,20 @@ contract SequenceHandler is Test {
         uint256 creditTo = vault.redeemable(to);
         uint256 balanceFrom = token.balanceOf(from);
         uint256 supply = vault.backedSupply();
+        uint256 remaining = credit - amount;
+        uint256 received = (from == to ? remaining : creditTo) + amount;
+        uint256 minCredit = vault.minRemainingCredit();
+        if ((remaining != 0 && remaining < minCredit) || received < minCredit) {
+            // Neither side may be left with dust; the sender's side is checked first.
+            probes++;
+            uint256 offending = remaining != 0 && remaining < minCredit ? remaining : received;
+            vm.prank(from);
+            vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.PositionTooSmall.selector, offending, minCredit));
+            vault.transferRedeemable(to, amount);
+            assertEq(vault.redeemable(from), credit, "credit: refused transfer changed the sender");
+            assertEq(vault.redeemable(to), creditTo, "credit: refused transfer changed the recipient");
+            return;
+        }
         vm.prank(from);
         vault.transferRedeemable(to, amount);
         if (from == to) {
@@ -293,6 +322,21 @@ contract SequenceHandler is Test {
             (bool refused, bytes memory err) = address(vault).call{value: amount}("");
             assertFalse(refused, "donate: accepted with nothing outstanding");
             assertEq(bytes4(err), RisingFloorVault.NothingOutstanding.selector, "donate: wrong refusal");
+            assertEq(vault.reserve(), reserveBefore, "donate: refused but kept");
+            return;
+        }
+        uint256 minReserve = vault.MIN_POSITION_VALUE();
+        if (reserveBefore < minReserve) {
+            // A donation against a dust reserve would pin the floor for the price of the donation.
+            probes++;
+            vm.prank(who);
+            (bool refused, bytes memory err) = address(vault).call{value: amount}("");
+            assertFalse(refused, "donate: accepted against a dust reserve");
+            assertEq(
+                err,
+                abi.encodeWithSelector(RisingFloorVault.ReserveBelowMinimum.selector, reserveBefore, minReserve),
+                "donate: wrong refusal"
+            );
             assertEq(vault.reserve(), reserveBefore, "donate: refused but kept");
             return;
         }
@@ -401,6 +445,131 @@ contract SequenceHandler is Test {
         assertEq(vault.buysPaused(), paused);
     }
 
+    /// @dev The owner ends the positions of the actors selected by `mask` (low four bits) in one
+    ///      call. If any selected actor holds no credit the whole call is refused and nothing moves;
+    ///      otherwise each is paid exactly its pro-rata share into escrow, in list order, the floor
+    ///      of whoever remains never falls, and ending the last credit empties the reserve.
+    function forceRedeem(uint256 mask) external {
+        mask = bound(mask, 1, 15);
+        uint256 count;
+        for (uint256 i; i < actors.length; ++i) {
+            if (mask & (1 << i) != 0) count++;
+        }
+        address[] memory holders = new address[](count);
+        uint256 k;
+        for (uint256 i; i < actors.length; ++i) {
+            if (mask & (1 << i) != 0) holders[k++] = actors[i];
+        }
+        if (_forceRedeemIsRefused(holders)) return;
+
+        uint256 balance = address(vault).balance;
+        uint256 floorBefore = vault.floorPrice();
+        uint256[] memory expected = _expectedForcedPayouts(holders);
+        uint256[] memory payoutsBefore = new uint256[](count);
+        for (uint256 i; i < count; ++i) {
+            payoutsBefore[i] = vault.pendingPayout(holders[i]);
+        }
+        uint256 supplyAfter = vault.backedSupply();
+        uint256 reserveAfter = vault.reserve();
+        uint256 escrowAfter = vault.totalPendingPayouts();
+
+        vm.prank(owner);
+        vault.forceRedeem(holders);
+
+        for (uint256 i; i < count; ++i) {
+            assertEq(vault.pendingPayout(holders[i]) - payoutsBefore[i], expected[i], "force: payout is not pro rata");
+            assertEq(vault.redeemable(holders[i]), 0, "force: credit survived");
+            supplyAfter -= _forcedCredit(i);
+            reserveAfter -= expected[i];
+            escrowAfter += expected[i];
+            tokensForced += _forcedCredit(i);
+        }
+        assertEq(vault.backedSupply(), supplyAfter, "force: supply");
+        assertEq(vault.reserve(), reserveAfter, "force: reserve");
+        assertEq(vault.totalPendingPayouts(), escrowAfter, "force: escrow total");
+        assertEq(address(vault).balance, balance, "force: ETH left the contract");
+        if (supplyAfter == 0) {
+            epochs++;
+            assertEq(vault.reserve(), 0, "force: ETH left behind with nobody to own it");
+            assertEq(vault.floorPrice(), vault.openingPrice(), "force: empty vault quotes the opening price");
+        } else {
+            assertGe(vault.floorPrice(), floorBefore, "force: the others' floor fell");
+        }
+        forced++;
+        _recordFloor();
+    }
+
+    uint256[] internal forcedCredits; // credits of the holders of the current forced redemption, in order
+
+    function _forcedCredit(uint256 i) internal view returns (uint256) {
+        return forcedCredits[i];
+    }
+
+    /// @dev If any listed holder has no credit the owner's call is refused as a whole; asserts that
+    ///      and reports it, so the caller skips the settlement checks.
+    function _forceRedeemIsRefused(address[] memory holders) internal returns (bool refused) {
+        uint256 supply = vault.backedSupply();
+        uint256 pendingBefore = vault.totalPendingPayouts();
+        for (uint256 i; i < holders.length; ++i) {
+            if (vault.redeemable(holders[i]) != 0) continue;
+            probes++;
+            vm.prank(owner);
+            vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.NoCredit.selector, holders[i]));
+            vault.forceRedeem(holders);
+            assertEq(vault.backedSupply(), supply, "force: refused call moved the supply");
+            assertEq(vault.totalPendingPayouts(), pendingBefore, "force: refused call escrowed");
+            return true;
+        }
+    }
+
+    /// @dev The pro-rata payouts the contract must produce for `holders` in order: each takes its
+    ///      share of what is left after the ones before it, and the one ending the supply takes all.
+    function _expectedForcedPayouts(address[] memory holders) internal returns (uint256[] memory expected) {
+        delete forcedCredits;
+        expected = new uint256[](holders.length);
+        uint256 supply = vault.backedSupply();
+        uint256 reserve = vault.reserve();
+        for (uint256 i; i < holders.length; ++i) {
+            uint256 credit = vault.redeemable(holders[i]);
+            forcedCredits.push(credit);
+            expected[i] = credit == supply ? reserve : credit.mulDiv(reserve, supply);
+            supply -= credit;
+            reserve -= expected[i];
+        }
+    }
+
+    /// @dev A force-redeemed actor takes its escrow, to itself or to another actor; an actor with
+    ///      nothing in escrow is refused.
+    function withdrawPayout(uint256 seed, uint256 toSeed) external {
+        address who = _actor(seed);
+        address to = _actor(toSeed >> 8);
+        uint256 pending = vault.pendingPayout(who);
+        if (pending == 0) {
+            probes++;
+            vm.prank(who);
+            vm.expectRevert(RisingFloorVault.NothingToWithdraw.selector);
+            vault.withdrawPayout(to);
+            return;
+        }
+        uint256 reserveBefore = vault.reserve();
+        uint256 floorBefore = vault.floorPrice();
+        uint256 totalBefore = vault.totalPendingPayouts();
+        uint256 toBefore = to.balance;
+        vm.prank(who);
+        uint256 out = vault.withdrawPayout(to);
+        assertEq(out, pending, "payout: amount");
+        assertEq(to.balance, toBefore + out, "payout: recipient");
+        assertEq(vault.pendingPayout(who), 0, "payout: not cleared");
+        assertEq(vault.totalPendingPayouts(), totalBefore - out, "payout: total");
+        assertEq(vault.reserve(), reserveBefore, "payout: touched the reserve");
+        assertEq(vault.floorPrice(), floorBefore, "payout: moved the floor");
+        // Paid once: a second withdrawal is refused.
+        vm.prank(who);
+        vm.expectRevert(RisingFloorVault.NothingToWithdraw.selector);
+        vault.withdrawPayout(to);
+        ethOut += out;
+    }
+
     // ------------------------------------------------------------------ probes
 
     /// @dev Nobody but the owner configures anything, whatever the state.
@@ -420,6 +589,10 @@ contract SequenceHandler is Test {
         vault.setToken(who);
         vm.expectRevert();
         vault.rescueERC20(IERC20(address(token)), who, 1);
+        address[] memory holders = new address[](1);
+        holders[0] = who;
+        vm.expectRevert();
+        vault.forceRedeem(holders);
         vm.expectRevert();
         vault.transferOwnership(who);
         vm.expectRevert();
@@ -495,7 +668,9 @@ contract RisingFloorVaultSequencesInvariantTest is Test {
         vm.stopPrank();
 
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](17);
+        bytes4[] memory selectors = new bytes4[](19);
+        selectors[17] = SequenceHandler.forceRedeem.selector;
+        selectors[18] = SequenceHandler.withdrawPayout.selector;
         selectors[0] = SequenceHandler.buy.selector;
         selectors[1] = SequenceHandler.buy.selector; // weighted: buys and sells are the core
         selectors[2] = SequenceHandler.sell.selector;
@@ -536,11 +711,22 @@ contract RisingFloorVaultSequencesInvariantTest is Test {
         assertLe(vault.minOpeningPrice(), vault.openingPrice());
     }
 
-    /// @dev ETH only enters through buys, donations or force, and only leaves through redemptions.
-    ///      Between epochs the reserve is empty but for ETH that was forced in without a call.
+    /// @dev ETH only enters through buys, donations or force, and only leaves through redemptions
+    ///      and escrow withdrawals. The balance is the reserve plus the escrow, the escrow is exactly
+    ///      the sum of the holders' pending payouts, and between epochs the reserve is empty but for
+    ///      ETH that was forced in without a call.
     function invariant_ethIsConserved() public view {
-        assertEq(vault.reserve(), handler.ethIn() - handler.ethOut());
+        assertEq(address(vault).balance, handler.ethIn() - handler.ethOut());
         assertLe(handler.ethOut(), handler.ethIn());
+        uint256 pending;
+        for (uint256 i; i < handler.actorCount(); ++i) {
+            pending += vault.pendingPayout(handler.actor(i));
+        }
+        assertEq(vault.totalPendingPayouts(), pending, "escrow total differs from the sum of the escrows");
+        assertEq(vault.pendingPayout(OWNER), 0, "the owner was paid an escrow");
+        assertEq(vault.pendingPayout(address(handler)), 0);
+        assertLe(pending, address(vault).balance, "escrow exceeds what is held");
+        assertEq(vault.reserve(), address(vault).balance - pending);
         assertEq(OWNER.balance, 0, "the owner has no path to the reserve");
         assertEq(address(handler).balance, 0);
         if (vault.backedSupply() == 0) {
@@ -548,12 +734,13 @@ contract RisingFloorVaultSequencesInvariantTest is Test {
         }
     }
 
-    /// @dev Every token outside the vault was sold by it and is what `backedSupply` counts; the rest
-    ///      of the supply is inventory, deposited minus withdrawn.
+    /// @dev Every token outside the vault was sold by it: what `backedSupply` counts plus what forced
+    ///      redemptions left uncredited with their holders; the rest of the supply is inventory,
+    ///      deposited minus withdrawn.
     function invariant_tokensAreConserved() public view {
         uint256 outside = _outside();
-        assertEq(vault.backedSupply(), outside);
-        assertEq(vault.backedSupply(), handler.tokensSold() - handler.tokensRedeemed());
+        assertEq(vault.backedSupply() + handler.tokensForced(), outside);
+        assertEq(vault.backedSupply(), handler.tokensSold() - handler.tokensRedeemed() - handler.tokensForced());
         assertEq(vault.inventory(), INITIAL_INVENTORY + handler.inventoryIn() - handler.inventoryOut() - outside);
         assertEq(token.balanceOf(OWNER), handler.inventoryOut());
         assertEq(token.balanceOf(address(handler)), 0);
@@ -577,9 +764,15 @@ contract RisingFloorVaultSequencesInvariantTest is Test {
     ///      holder of all the credit is owed all of it.
     function invariant_reserveIsSolvent() public view {
         uint256 supply = vault.backedSupply();
-        if (supply == 0) return;
+        if (supply == 0) {
+            assertEq(vault.minRemainingCredit(), 0);
+            return;
+        }
         uint256 reserve = vault.reserve();
         assertGt(reserve, 0);
+        // The dust threshold is the credit worth MIN_POSITION_VALUE at the floor, rounded up, and a
+        // whole position is always below or at it: nothing can be trapped between the two rules.
+        assertEq(vault.minRemainingCredit(), vault.MIN_POSITION_VALUE().mulDiv(supply, reserve, Math.Rounding.Ceil));
         uint256 owed;
         for (uint256 i; i < handler.actorCount(); ++i) {
             address who = handler.actor(i);

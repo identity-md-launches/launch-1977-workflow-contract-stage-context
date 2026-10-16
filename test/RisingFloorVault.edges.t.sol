@@ -6,6 +6,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {RisingFloorVault} from "../src/RisingFloorVault.sol";
@@ -83,6 +84,49 @@ contract RisingFloorVaultEdgesTest is Test {
 
     function _expectOnlyOwner(address caller) internal {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, caller));
+    }
+
+    function _forceRedeem(address holder) internal {
+        address[] memory holders = new address[](1);
+        holders[0] = holder;
+        vm.prank(OWNER);
+        vault.forceRedeem(holders);
+    }
+
+    /// @dev Redeems `amount` for `who`, or asserts the exact `PositionTooSmall` refusal when the
+    ///      credit it would leave behind is dust. Returns whether anything was redeemed.
+    function _sellOrExpectDust(address who, uint256 amount) internal returns (bool sold) {
+        uint256 remaining = vault.redeemable(who) - amount;
+        uint256 min = vault.minRemainingCredit();
+        vm.startPrank(who);
+        token.approve(address(vault), amount);
+        if (remaining != 0 && remaining < min) {
+            vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.PositionTooSmall.selector, remaining, min));
+            vault.sell(amount, 0);
+        } else {
+            vault.sell(amount, 0);
+            sold = true;
+        }
+        vm.stopPrank();
+    }
+
+    /// @dev Moves credit, or asserts the exact `PositionTooSmall` refusal when either side would be
+    ///      left with dust. Returns whether the credit moved.
+    function _transferCreditOrExpectDust(address from, address to, uint256 amount) internal returns (bool moved) {
+        uint256 remaining = vault.redeemable(from) - amount;
+        uint256 received = (from == to ? remaining : vault.redeemable(to)) + amount;
+        uint256 min = vault.minRemainingCredit();
+        vm.prank(from);
+        if (remaining != 0 && remaining < min) {
+            vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.PositionTooSmall.selector, remaining, min));
+            vault.transferRedeemable(to, amount);
+        } else if (received < min) {
+            vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.PositionTooSmall.selector, received, min));
+            vault.transferRedeemable(to, amount);
+        } else {
+            vault.transferRedeemable(to, amount);
+            moved = true;
+        }
     }
 
     // ------------------------------------------------------------------ deployment through a factory
@@ -751,6 +795,393 @@ contract RisingFloorVaultEdgesTest is Test {
         assertEq(vault.reserve(), 0);
     }
 
+    // ------------------------------------------------------------------ dust rule boundaries
+
+    function test_sell_leavingExactlyTheMinimumIsAccepted_oneUnitLessIsNot() public {
+        _configure();
+        uint256 bought = _buy(ALICE, 1 ether);
+        uint256 min = vault.minRemainingCredit();
+        assertEq(min, 10e18, "0.01 ETH at the opening price is ten whole tokens");
+        assertGt(bought, min);
+        // The boundary is checked against the floor before the sale, so the exact minimum passes.
+        assertFalse(_sellOrExpectDust(ALICE, bought - (min - 1)));
+        assertTrue(_sellOrExpectDust(ALICE, bought - min));
+        assertEq(vault.redeemable(ALICE), min);
+        // The fee lifted the floor, so what is left is now worth more than the minimum and may be
+        // reduced again, but never to a nonzero credit under the new minimum.
+        assertLe(vault.minRemainingCredit(), min);
+        assertTrue(_sellOrExpectDust(ALICE, min), "a whole position may always leave");
+        assertEq(vault.backedSupply(), 0);
+        assertEq(vault.reserve(), 0);
+    }
+
+    function test_transferRedeemable_recipientHoldingDustCanOnlyBeToppedUpToTheMinimum() public {
+        _configure();
+        uint256 bought = _buy(ALICE, 1 ether);
+        // A buy is allowed to create a dust position (Bob pays 0.001 ETH for one token).
+        uint256 dust = _buy(BOB, 0.001 ether);
+        uint256 min = vault.minRemainingCredit();
+        assertLt(dust, min);
+        assertGt(dust, 0);
+        // Topping Bob up to one unit under the minimum is refused; to exactly the minimum is not.
+        assertFalse(_transferCreditOrExpectDust(ALICE, BOB, min - dust - 1));
+        assertTrue(_transferCreditOrExpectDust(ALICE, BOB, min - dust));
+        assertEq(vault.redeemable(BOB), min);
+        assertEq(vault.redeemable(ALICE) + vault.redeemable(BOB), bought + dust);
+    }
+
+    function test_transferRedeemable_wholeDustPositionCannotMoveToAnEmptyAccount() public {
+        _configure();
+        _buy(ALICE, 1 ether);
+        uint256 dust = _buy(BOB, 0.001 ether);
+        // Bob's position is below the minimum: it may join a large position but may not start a
+        // new one, and it may leave whole.
+        assertFalse(_transferCreditOrExpectDust(BOB, CAROL, dust));
+        assertTrue(_transferCreditOrExpectDust(BOB, ALICE, dust));
+        assertEq(vault.redeemable(BOB), 0);
+        uint256 back = _buy(BOB, 0.001 ether);
+        uint256 quote = vault.quoteSellFor(BOB, back);
+        assertGt(quote, 0);
+        assertEq(_sell(BOB, back), quote);
+        assertEq(vault.redeemable(BOB), 0);
+    }
+
+    function test_transferRedeemable_selfTransferIsRefusedWhenTheRemainderWouldBeDust() public {
+        // A self-transfer changes nothing, but it is checked like any other: the credit "left
+        // behind" between the debit and the credit must not be dust. Harmless, and documented
+        // here so the website does not offer it as a no-op.
+        _configure();
+        uint256 bought = _buy(ALICE, 1 ether);
+        uint256 min = vault.minRemainingCredit();
+        assertFalse(_transferCreditOrExpectDust(ALICE, ALICE, bought - 1));
+        assertTrue(_transferCreditOrExpectDust(ALICE, ALICE, bought - min));
+        assertTrue(_transferCreditOrExpectDust(ALICE, ALICE, bought));
+        assertEq(vault.redeemable(ALICE), bought);
+    }
+
+    function test_buy_canCreateAOneWeiDustPosition_unsellableAfterFeeButForceRedeemPaysTheFloor() public {
+        _configure(0, FEE, OPENING);
+        _buy(ALICE, 1 ether);
+        // One wei buys 1000 base units at 0.001 ETH per token: a position worth exactly one wei
+        // at the floor and nothing after the fee, so the holder cannot sell it at all.
+        uint256 dust = _buy(BOB, 1);
+        assertEq(dust, 1000);
+        assertEq(vault.quoteSellFor(BOB, dust), 0, "worth less than a wei after the fee");
+        vm.startPrank(BOB);
+        token.approve(address(vault), dust);
+        vm.expectRevert(RisingFloorVault.ZeroOutput.selector);
+        vault.sell(dust, 0);
+        vm.stopPrank();
+        // The owner can end it; a forced redemption pays the full floor value, no fee: one wei.
+        uint256 floorBefore = vault.floorPrice();
+        _forceRedeem(BOB);
+        assertEq(vault.redeemable(BOB), 0);
+        assertEq(vault.pendingPayout(BOB), 1);
+        assertEq(vault.totalPendingPayouts(), 1);
+        assertEq(vault.reserve(), 1 ether);
+        assertEq(vault.backedSupply(), vault.redeemable(ALICE));
+        assertGe(vault.floorPrice(), floorBefore);
+        vm.prank(BOB);
+        assertEq(vault.withdrawPayout(BOB), 1);
+        assertEq(BOB.balance, 10_000 ether, "one wei in, one wei out");
+        vm.prank(BOB);
+        vm.expectRevert(RisingFloorVault.NothingToWithdraw.selector);
+        vault.withdrawPayout(BOB);
+        assertEq(token.balanceOf(BOB), dust, "the holder keeps the tokens");
+    }
+
+    // ------------------------------------------------------------------ forceRedeem / escrow
+
+    function test_forceRedeem_duplicateHolderRevertsTheWholeCall() public {
+        _configure();
+        uint256 a = _buy(ALICE, 1 ether);
+        uint256 b = _buy(BOB, 1 ether);
+        address[] memory holders = new address[](3);
+        holders[0] = ALICE;
+        holders[1] = BOB;
+        holders[2] = ALICE; // already cleared by entry 0 within this call
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.NoCredit.selector, ALICE));
+        vault.forceRedeem(holders);
+        // Atomic: the first two entries left no trace.
+        assertEq(vault.redeemable(ALICE), a);
+        assertEq(vault.redeemable(BOB), b);
+        assertEq(vault.backedSupply(), a + b);
+        assertEq(vault.pendingPayout(ALICE), 0);
+        assertEq(vault.pendingPayout(BOB), 0);
+        assertEq(vault.totalPendingPayouts(), 0);
+    }
+
+    function test_forceRedeem_allHoldersInOneCallSplitExactlyTheReserve() public {
+        _configure(0, 0, OPENING);
+        _buy(ALICE, 1 ether);
+        _buy(BOB, 2 ether);
+        _buy(CAROL, 0.5 ether);
+        uint256 reserveBefore = vault.reserve();
+        address[] memory holders = new address[](3);
+        holders[0] = CAROL;
+        holders[1] = ALICE;
+        holders[2] = BOB; // the last entry is the last holder and takes the rounding residue
+        vm.prank(OWNER);
+        vault.forceRedeem(holders);
+        assertEq(vault.backedSupply(), 0);
+        assertEq(vault.reserve(), 0, "nothing is left behind for nobody");
+        assertEq(vault.totalPendingPayouts(), reserveBefore);
+        assertEq(address(vault).balance, reserveBefore);
+        assertEq(
+            vault.pendingPayout(ALICE) + vault.pendingPayout(BOB) + vault.pendingPayout(CAROL),
+            reserveBefore,
+            "the escrow is exactly the reserve that was split"
+        );
+        assertEq(vault.floorPrice(), OPENING, "the epoch reopened at the opening price");
+        // Each payout is at least the floor value the holder was guaranteed, net of rounding.
+        assertGe(vault.pendingPayout(ALICE), 1 ether - 1);
+        assertGe(vault.pendingPayout(CAROL), 0.5 ether - 1);
+        assertGe(vault.pendingPayout(BOB), 2 ether - 1);
+    }
+
+    function test_forceRedeem_escrowIsNotReserve_quotesPricesAndTheNextEpochIgnoreIt() public {
+        _configure(0, 0, OPENING);
+        uint256 a = _buy(ALICE, 1 ether);
+        _buy(BOB, 1 ether);
+        _forceRedeem(BOB);
+        uint256 pending = vault.pendingPayout(BOB);
+        assertEq(pending, 1 ether);
+        assertEq(address(vault).balance, 2 ether);
+        assertEq(vault.reserve(), 1 ether, "escrow is held but not backing");
+        assertEq(vault.floorPrice(), OPENING);
+        assertEq(vault.askPrice(), OPENING);
+        assertEq(vault.bidPrice(), OPENING);
+        assertEq(vault.quoteSellFor(ALICE, a), 1 ether, "the sole holder is quoted the reserve, not the balance");
+        assertEq(vault.quoteBuy(1 ether), a, "the ask does not price the escrow in");
+        // Alice leaves with the reserve; Bob's escrow stays untouched for him alone.
+        assertEq(_sell(ALICE, a), 1 ether);
+        assertEq(vault.backedSupply(), 0);
+        assertEq(vault.reserve(), 0);
+        assertEq(address(vault).balance, pending);
+        // A new epoch opens at the opening price: the escrow does not inflate the first buyer's floor.
+        uint256 c = _buy(CAROL, 1 ether);
+        assertEq(c, a);
+        assertEq(vault.floorPrice(), OPENING);
+        assertEq(vault.quoteSellFor(CAROL, c), 1 ether);
+        vm.prank(ALICE);
+        vm.expectRevert(RisingFloorVault.NothingToWithdraw.selector);
+        vault.withdrawPayout(ALICE);
+        vm.prank(BOB);
+        assertEq(vault.withdrawPayout(BOB), pending);
+        assertEq(vault.reserve(), 1 ether);
+        assertEq(address(vault).balance, 1 ether);
+    }
+
+    function test_forceRedeem_lastHolderReopensTheEpoch_andTheEscrowSurvivesIt() public {
+        _configure();
+        _buy(ALICE, 1 ether);
+        _forceRedeem(ALICE);
+        assertEq(vault.pendingPayout(ALICE), 1 ether);
+        assertEq(vault.backedSupply(), 0);
+        assertEq(vault.reserve(), 0);
+        assertEq(vault.minRemainingCredit(), 0);
+        // Between epochs: donations refused, opening price adjustable, ratchet intact.
+        vm.prank(BOB);
+        (bool ok, bytes memory err) = address(vault).call{value: 1 ether}("");
+        assertFalse(ok);
+        assertEq(bytes4(err), RisingFloorVault.NothingOutstanding.selector);
+        assertEq(vault.minOpeningPrice(), OPENING);
+        vm.startPrank(OWNER);
+        vm.expectRevert(
+            abi.encodeWithSelector(RisingFloorVault.OpeningPriceBelowMinimum.selector, OPENING - 1, OPENING)
+        );
+        vault.setOpeningPrice(OPENING - 1);
+        vault.setOpeningPrice(2 * OPENING);
+        vm.stopPrank();
+        // The owner cannot reach the escrow either: no function takes ETH out but withdrawPayout.
+        vm.prank(OWNER);
+        vm.expectRevert(RisingFloorVault.NothingToWithdraw.selector);
+        vault.withdrawPayout(OWNER);
+        assertEq(OWNER.balance, 0);
+        vm.prank(ALICE);
+        assertEq(vault.withdrawPayout(ALICE), 1 ether);
+        assertEq(address(vault).balance, 0);
+    }
+
+    function test_forceRedeem_thatDrainsTheReserveUnderTheMinimumBlocksDonations() public {
+        _configure();
+        _buy(ALICE, 1 ether);
+        _buy(BOB, 0.005 ether);
+        _forceRedeem(ALICE);
+        uint256 escrowed = vault.pendingPayout(ALICE);
+        assertGe(escrowed, 1 ether, "Bob's premium went to Alice");
+        uint256 left = vault.reserve();
+        assertLt(left, vault.MIN_POSITION_VALUE());
+        assertGt(left, 0);
+        vm.prank(CAROL);
+        (bool ok, bytes memory err) = address(vault).call{value: 1 ether}("");
+        assertFalse(ok, "a donation against dust would pin the floor");
+        assertEq(
+            err, abi.encodeWithSelector(RisingFloorVault.ReserveBelowMinimum.selector, left, vault.MIN_POSITION_VALUE())
+        );
+        // Including a payout Alice tries to route into the vault as a donation.
+        vm.prank(ALICE);
+        vm.expectRevert(RisingFloorVault.EthTransferFailed.selector);
+        vault.withdrawPayout(address(vault));
+        assertEq(vault.pendingPayout(ALICE), escrowed, "a failed withdrawal keeps the escrow");
+        assertEq(vault.totalPendingPayouts(), escrowed);
+        // Buys still lift the reserve past the minimum, after which donations are accepted again.
+        _buy(CAROL, 1 ether);
+        assertGe(vault.reserve(), vault.MIN_POSITION_VALUE());
+        vm.prank(CAROL);
+        (ok,) = address(vault).call{value: 1 ether}("");
+        assertTrue(ok);
+    }
+
+    function test_withdrawPayout_intoTheVaultBecomesADonationWhileSomethingIsOutstanding() public {
+        _configure(0, 0, OPENING);
+        uint256 a = _buy(ALICE, 1 ether);
+        _buy(BOB, 1 ether);
+        _forceRedeem(BOB);
+        // Bob names the vault as recipient: the escrow is released and comes straight back as a
+        // donation to the remaining holder. Nothing is lost or double counted.
+        vm.prank(BOB);
+        assertEq(vault.withdrawPayout(address(vault)), 1 ether);
+        assertEq(vault.pendingPayout(BOB), 0);
+        assertEq(vault.totalPendingPayouts(), 0);
+        assertEq(vault.reserve(), 2 ether);
+        assertEq(address(vault).balance, 2 ether);
+        assertEq(vault.floorPrice(), 2 * OPENING);
+        assertEq(_sell(ALICE, a), 2 ether);
+        assertEq(address(vault).balance, 0);
+    }
+
+    function test_withdrawPayout_cannotReenterItselfOrBuy_andCannotMoveClearedCredit() public {
+        _configure(0, 0, OPENING);
+        PayoutReenterer holder = new PayoutReenterer(vault, token);
+        vm.deal(address(holder), 1 ether);
+        holder.buy(1 ether);
+        _buy(ALICE, 1 ether);
+        _forceRedeem(address(holder));
+        assertEq(vault.pendingPayout(address(holder)), 1 ether);
+
+        // Re-entering withdrawPayout is stopped by the guard; the outer withdrawal still completes
+        // because the hook swallows the failure, and the escrow is paid exactly once.
+        holder.withdraw(0);
+        assertEq(address(holder).balance, 1 ether);
+        assertEq(vault.pendingPayout(address(holder)), 0);
+        assertEq(vault.totalPendingPayouts(), 0);
+        assertEq(bytes4(holder.reentryError()), ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        assertFalse(holder.reentrySucceeded());
+
+        // Buy from the hook is also guarded, and the hook cannot move credit it no longer has.
+        _forceRedeemAfterRebuy(holder, 1);
+        assertEq(bytes4(holder.reentryError()), ReentrancyGuard.ReentrancyGuardReentrantCall.selector);
+        _forceRedeemAfterRebuy(holder, 2);
+        assertEq(holder.reentryError(), abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, 0, 1));
+        assertFalse(holder.reentrySucceeded());
+        assertEq(vault.redeemable(ALICE), vault.backedSupply(), "credits still sum to the supply");
+        assertEq(vault.totalPendingPayouts(), 0);
+    }
+
+    function _forceRedeemAfterRebuy(PayoutReenterer holder, uint8 mode) internal {
+        vm.deal(address(holder), 1 ether);
+        holder.buy(1 ether);
+        _forceRedeem(address(holder));
+        holder.withdraw(mode);
+        assertEq(vault.pendingPayout(address(holder)), 0);
+    }
+
+    function test_forceRedeem_isRefusedToEveryoneButTheOwner_includingPendingOwnerAndHolder() public {
+        _configure();
+        _buy(ALICE, 1 ether);
+        address[] memory holders = new address[](1);
+        holders[0] = ALICE;
+        vm.prank(OWNER);
+        vault.transferOwnership(BOB);
+        _expectOnlyOwner(BOB);
+        vm.prank(BOB);
+        vault.forceRedeem(holders);
+        _expectOnlyOwner(ALICE);
+        vm.prank(ALICE);
+        vault.forceRedeem(holders);
+        _expectOnlyOwner(address(this));
+        vault.forceRedeem(holders);
+        assertEq(vault.redeemable(ALICE), vault.backedSupply());
+    }
+
+    function test_forceRedeem_andWithdrawPayout_workWhilePausedAndAfterRenounce() public {
+        _configure();
+        uint256 a = _buy(ALICE, 1 ether);
+        _buy(BOB, 1 ether);
+        vm.prank(OWNER);
+        vault.setBuysPaused(true);
+        _forceRedeem(BOB);
+        uint256 pending = vault.pendingPayout(BOB);
+        assertGt(pending, 0);
+        vm.prank(OWNER);
+        vault.renounceOwnership();
+        // No owner any more: nobody can force-redeem, but the escrow and the exits are untouched.
+        address[] memory holders = new address[](1);
+        holders[0] = ALICE;
+        _expectOnlyOwner(ALICE);
+        vm.prank(ALICE);
+        vault.forceRedeem(holders);
+        _expectOnlyOwner(OWNER);
+        vm.prank(OWNER);
+        vault.forceRedeem(holders);
+        vm.prank(BOB);
+        assertEq(vault.withdrawPayout(BOB), pending);
+        assertEq(_sell(ALICE, a), 2 ether - pending);
+        assertEq(address(vault).balance, 0);
+    }
+
+    // ------------------------------------------------------------------ fuzz: escrow conservation
+
+    function testFuzz_forceRedeemConservesEthAcrossEscrowAndExit(
+        uint256 ethA,
+        uint256 ethB,
+        uint256 ethC,
+        uint256 premium,
+        uint256 fee
+    ) public {
+        ethA = bound(ethA, 1 gwei, 100 ether);
+        ethB = bound(ethB, 1 gwei, 100 ether);
+        ethC = bound(ethC, 1, 100 ether);
+        premium = bound(premium, 0, 2_000);
+        fee = bound(fee, 0, 1_000);
+        _configure(premium, fee, OPENING);
+        token.mint(address(vault), type(uint128).max);
+        uint256 a = _buy(ALICE, ethA);
+        uint256 b = _buy(BOB, ethB);
+        uint256 ethIn = ethA + ethB;
+        if (vault.quoteBuy(ethC) > 0) {
+            _buy(CAROL, ethC);
+            ethIn += ethC;
+        }
+        uint256 supply = vault.backedSupply();
+        uint256 reserve = vault.reserve();
+        uint256 floorBefore = vault.floorPrice();
+
+        _forceRedeem(BOB);
+        uint256 payoutB = vault.pendingPayout(BOB);
+        assertEq(payoutB, b.mulDiv(reserve, supply), "paid the exact pro-rata share, rounded down");
+        assertGe(payoutB + 1, b.mulDiv(floorBefore, WAD), "never under the floor value but for rounding");
+        assertEq(vault.reserve() + vault.totalPendingPayouts(), ethIn, "ETH is conserved across the split");
+        assertEq(address(vault).balance, ethIn);
+        assertGe(vault.floorPrice(), floorBefore, "the others' floor never falls");
+
+        // Everyone else leaves; the remaining holders redeem whole, so no dust rule applies.
+        uint256 outA = _sell(ALICE, a);
+        uint256 outC;
+        uint256 c = vault.redeemable(CAROL);
+        if (c > 0) outC = _sell(CAROL, c);
+        assertEq(vault.backedSupply(), 0);
+        assertEq(vault.reserve(), 0, "the last redemption empties the reserve");
+        assertEq(address(vault).balance, payoutB, "only the escrow is left");
+        vm.prank(BOB);
+        assertEq(vault.withdrawPayout(BOB), payoutB);
+        assertEq(outA + outC + payoutB, ethIn, "every wei that came in went out to a holder");
+        assertEq(address(vault).balance, 0);
+        assertEq(OWNER.balance, 0);
+    }
+
     // ------------------------------------------------------------------ fuzz: quotes are exact
 
     function testFuzz_quoteBuyMatchesBuyInAnyState(uint256 seed, uint256 ethIn, uint256 premium, uint256 fee) public {
@@ -761,9 +1192,10 @@ contract RisingFloorVaultEdgesTest is Test {
         _configure(premium, fee, OPENING);
         token.mint(address(vault), type(uint128).max);
         _buy(ALICE, seed);
-        // A partial redemption with fee makes the reserve irregular (skipped when it would be dust).
+        // A partial redemption with fee makes the reserve irregular; when the remainder would be
+        // dust the redemption is refused instead, and the quote must still match from that state.
         uint256 third = vault.backedSupply() / 3;
-        if (third > 0 && vault.quoteSellFor(ALICE, third) > 0) _sell(ALICE, third);
+        if (third > 0 && vault.quoteSellFor(ALICE, third) > 0) _sellOrExpectDust(ALICE, third);
 
         uint256 quote = vault.quoteBuy(ethIn);
         uint256 askBefore = vault.askPrice();
@@ -803,7 +1235,15 @@ contract RisingFloorVaultEdgesTest is Test {
             vm.stopPrank();
             return;
         }
-        uint256 out = _sell(BOB, amount);
+        // The quote is unconditional; the redemption is refused only by what it would leave behind.
+        uint256 reserveBefore = vault.reserve();
+        if (!_sellOrExpectDust(BOB, amount)) {
+            assertEq(vault.redeemable(BOB), held, "a refused redemption changed the credit");
+            assertEq(vault.reserve(), reserveBefore, "a refused redemption moved ETH");
+            assertEq(vault.quoteSellFor(BOB, amount), quote, "a refused redemption changed the quote");
+            return;
+        }
+        uint256 out = reserveBefore - vault.reserve();
         assertEq(out, quote, "quote must be what the seller receives");
         // Received per token is at most the bid (the bid view itself rounds twice, hence the 1 wei).
         assertLe(out.mulDiv(WAD, amount), bidBefore + 1);
@@ -814,10 +1254,8 @@ contract RisingFloorVaultEdgesTest is Test {
         uint256 bought = _buy(ALICE, 1 ether);
         extra = bound(extra, 1, type(uint256).max - bought);
         moved = bound(moved, 0, bought);
-        if (moved > 0) {
-            vm.prank(ALICE);
-            vault.transferRedeemable(BOB, moved);
-        }
+        // A transfer that would leave either side with dust is refused and moves nothing.
+        if (moved > 0 && !_transferCreditOrExpectDust(ALICE, BOB, moved)) moved = 0;
         uint256 creditA = bought - moved;
         assertEq(vault.quoteSellFor(ALICE, creditA + 1), 0);
         assertEq(vault.quoteSellFor(ALICE, bought + extra), 0);
@@ -935,7 +1373,15 @@ contract RisingFloorVaultEdgesTest is Test {
         keep = bound(keep, 1, bought);
         uint256 amount = bought - keep;
         if (amount == 0 || vault.quoteSellFor(ALICE, amount) == 0) return;
-        _sell(ALICE, amount);
+        // Keeping less than `MIN_POSITION_VALUE` worth is refused: that is the dust rule, and the
+        // only way out of such a position is to redeem it whole.
+        if (!_sellOrExpectDust(ALICE, amount)) {
+            assertLt(keep, vault.minRemainingCredit());
+            assertEq(vault.backedSupply(), bought);
+            assertEq(vault.reserve(), ethIn);
+            assertEq(_sell(ALICE, bought), ethIn, "a whole position may always leave");
+            return;
+        }
         assertGt(vault.reserve(), 0, "supply outstanding with an empty reserve");
         assertEq(vault.backedSupply(), keep);
         assertGe(vault.floorPrice(), 1);
@@ -951,15 +1397,12 @@ contract RisingFloorVaultEdgesTest is Test {
         uint256 bought = _buy(ALICE, ethIn);
         toBob = bound(toBob, 0, bought);
         toCarol = bound(toCarol, 0, bought - toBob);
-        vm.startPrank(ALICE);
-        if (toBob > 0) vault.transferRedeemable(BOB, toBob);
-        if (toCarol > 0) vault.transferRedeemable(CAROL, toCarol);
-        vm.stopPrank();
+        // Each move either happens whole or is refused whole (dust on either side); the credits
+        // are conserved either way.
+        if (toBob > 0 && !_transferCreditOrExpectDust(ALICE, BOB, toBob)) toBob = 0;
+        if (toCarol > 0 && !_transferCreditOrExpectDust(ALICE, CAROL, toCarol)) toCarol = 0;
         back = bound(back, 0, toBob);
-        if (back > 0) {
-            vm.prank(BOB);
-            vault.transferRedeemable(ALICE, back);
-        }
+        if (back > 0 && !_transferCreditOrExpectDust(BOB, ALICE, back)) back = 0;
         assertEq(vault.redeemable(ALICE), bought - toBob - toCarol + back);
         assertEq(vault.redeemable(BOB), toBob - back);
         assertEq(vault.redeemable(CAROL), toCarol);
@@ -999,5 +1442,57 @@ contract CreditForwarder {
         if (credit == 0) return;
         vault.transferRedeemable(beneficiary, credit);
         forwarded += credit;
+    }
+}
+
+/// @dev Force-redeemed holder whose ETH receive hook, while its escrow is being paid out, tries to
+///      withdraw again (mode 0), buy with the ETH arriving (mode 1) or move credit it no longer has
+///      (mode 2). Records the outcome; never reverts, so the outer withdrawal completes.
+contract PayoutReenterer {
+    RisingFloorVault public immutable vault;
+    IERC20 public immutable token;
+    uint8 public mode;
+    bool public armed;
+    bool public reentrySucceeded;
+    bytes public reentryError;
+
+    constructor(RisingFloorVault vault_, IERC20 token_) {
+        vault = vault_;
+        token = token_;
+    }
+
+    function buy(uint256 ethIn) external {
+        vault.buy{value: ethIn}(0);
+    }
+
+    function withdraw(uint8 mode_) external {
+        mode = mode_;
+        armed = true;
+        delete reentryError;
+        vault.withdrawPayout(address(this));
+    }
+
+    receive() external payable {
+        if (!armed) return;
+        armed = false;
+        if (mode == 0) {
+            try vault.withdrawPayout(address(this)) {
+                reentrySucceeded = true;
+            } catch (bytes memory err) {
+                reentryError = err;
+            }
+        } else if (mode == 1) {
+            try vault.buy{value: msg.value}(0) {
+                reentrySucceeded = true;
+            } catch (bytes memory err) {
+                reentryError = err;
+            }
+        } else {
+            try vault.transferRedeemable(address(0xA11CE), 1) {
+                reentrySucceeded = true;
+            } catch (bytes memory err) {
+                reentryError = err;
+            }
+        }
     }
 }
