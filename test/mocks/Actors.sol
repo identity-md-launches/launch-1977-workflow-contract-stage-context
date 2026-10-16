@@ -11,7 +11,7 @@ contract ReentrantSeller {
     uint256 public reenterAmount;
     bool public reentrySucceeded;
     bytes public reentryError;
-    uint8 public mode; // 0 = sell again, 1 = buy, 2 = depositInventory
+    uint8 public mode; // 0 = sell again, 1 = buy, 2 = depositInventory, 3 = sell from a payout
 
     constructor(RisingFloorVault vault_, IERC20 token_) {
         vault = vault_;
@@ -25,11 +25,19 @@ contract ReentrantSeller {
         vault.sell(amount, 0);
     }
 
+    /// @dev Withdraws an escrowed payout and tries to re-enter `sell` while the ETH arrives.
+    function attackWithdraw(uint256 reenterAmount_, uint8 mode_) external {
+        reenterAmount = reenterAmount_;
+        mode = mode_;
+        token.approve(address(vault), type(uint256).max);
+        vault.withdrawPayout(address(this));
+    }
+
     receive() external payable {
         if (reenterAmount == 0) return;
         uint256 amount = reenterAmount;
         reenterAmount = 0;
-        if (mode == 0) {
+        if (mode == 0 || mode == 3) {
             try vault.sell(amount, 0) {
                 reentrySucceeded = true;
             } catch (bytes memory err) {
@@ -64,6 +72,10 @@ contract RejectingReceiver {
     function sell(uint256 amount) external {
         token.approve(address(vault), amount);
         vault.sell(amount, 0);
+    }
+
+    function withdrawPayout(address to) external {
+        vault.withdrawPayout(to);
     }
 
     receive() external payable {

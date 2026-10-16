@@ -25,11 +25,19 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///   * a sell removes ETH at or below the floor, so the average backing per token rises;
 ///   * a donation adds ETH and removes nothing.
 /// Nobody, including the owner, can withdraw ETH from the reserve: the only way ETH leaves is a
-/// redemption by a credited holder. Redemptions can never be paused. The redemption that returns
-/// the backed supply to zero pays out the whole reserve, so the reserve is empty whenever nothing
-/// is outstanding and ETH is refused in that state: nothing is ever priced into nobody's tokens.
-/// The owner sets the opening price of each epoch and can never set it below an opening price at
-/// which the vault has already sold.
+/// redemption by a credited holder, or a forced redemption that pays a holder their full floor
+/// value into an escrow only they can withdraw. Redemptions can never be paused. The redemption
+/// that returns the backed supply to zero pays out the whole reserve, so the reserve is empty
+/// whenever nothing is outstanding and ETH is refused in that state: nothing is ever priced into
+/// nobody's tokens. The owner sets the opening price of each epoch and can never set it below an
+/// opening price at which the vault has already sold.
+///
+/// Because fees and rounding residue stay in the reserve for whoever still holds credit, a tiny
+/// remaining position would concentrate them and pin the floor (and therefore the ask) at an
+/// absurd level. Two things keep that from stalling sales: a partial redemption or a credit
+/// transfer may not leave a nonzero position worth less than `MIN_POSITION_VALUE` at the floor,
+/// and the owner may force-redeem any position at its full floor value (`forceRedeem`), which
+/// clears a pinned floor without paying anybody less than their guarantee.
 ///
 /// The token is launched after this contract, so its address is set once by the owner through
 /// `setToken`; every token feature is disabled until then.
@@ -52,6 +60,10 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     uint256 public constant MAX_BUY_PREMIUM_BPS = 2_000;
     /// @notice Highest redemption fee under the floor the owner may configure (10%).
     uint256 public constant MAX_SELL_FEE_BPS = 1_000;
+    /// @notice Smallest value, at the floor, a nonzero position may be left with by a partial
+    ///         redemption or a credit transfer, and the smallest reserve a donation is accepted
+    ///         against. Keeps fee residue from being concentrated onto dust (0.01 ETH).
+    uint256 public constant MIN_POSITION_VALUE = 0.01 ether;
 
     // ---------------------------------------------------------------------------------------------
     // Storage
@@ -77,6 +89,10 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     /// @notice Token base units each account may redeem: credited by `buy`, spent by `sell`,
     ///         movable with `transferRedeemable`. The credits always sum to `backedSupply`.
     mapping(address account => uint256) public redeemable;
+    /// @notice ETH owed to an account by a forced redemption, withdrawable with `withdrawPayout`.
+    mapping(address account => uint256) public pendingPayout;
+    /// @notice Sum of all `pendingPayout`; held by the contract but not part of the reserve.
+    uint256 public totalPendingPayouts;
 
     // ---------------------------------------------------------------------------------------------
     // Events
@@ -89,6 +105,8 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     event Bought(address indexed buyer, uint256 ethIn, uint256 tokensOut, uint256 floorAfter);
     event Sold(address indexed seller, uint256 tokensIn, uint256 ethOut, uint256 floorAfter);
     event RedeemableTransferred(address indexed from, address indexed to, uint256 amount);
+    event ForceRedeemed(address indexed holder, uint256 credit, uint256 ethOut, uint256 floorAfter);
+    event PayoutWithdrawn(address indexed holder, address indexed to, uint256 amount);
     event ReserveDonated(address indexed from, uint256 amount);
     event InventoryDeposited(address indexed from, uint256 amount);
     event InventoryWithdrawn(address indexed to, uint256 amount);
@@ -114,6 +132,10 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     error OpeningPriceBelowMinimum(uint256 requested, uint256 min);
     error InsufficientInventory(uint256 available, uint256 requested);
     error ExceedsRedeemable(uint256 redeemable, uint256 requested);
+    error PositionTooSmall(uint256 remaining, uint256 minRemaining);
+    error ReserveBelowMinimum(uint256 reserve, uint256 min);
+    error NoCredit(address holder);
+    error NothingToWithdraw();
     error SlippageExceeded(uint256 actual, uint256 min);
     error NonStandardTokenTransfer(uint256 expected, uint256 received);
     error EthTransferFailed();
@@ -127,10 +149,14 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     constructor(address owner_) Ownable(owner_) {}
 
     /// @notice Plain ETH transfers are donations to the reserve and raise the floor for the holders
-    ///         credited at that moment. Refused while nothing is outstanding: ETH held with no
-    ///         backed token would otherwise be captured by the next buyer, whatever they pay.
+    ///         credited at that moment. Refused while nothing is outstanding (ETH held with no
+    ///         backed token would otherwise be captured by the next buyer, whatever they pay) and
+    ///         while the reserve is below `MIN_POSITION_VALUE` (a donation against dust would pin
+    ///         the floor for the price of the donation).
     receive() external payable {
         if (backedSupply == 0) revert NothingOutstanding();
+        uint256 reserveBefore = _reserve() - msg.value;
+        if (reserveBefore < MIN_POSITION_VALUE) revert ReserveBelowMinimum(reserveBefore, MIN_POSITION_VALUE);
         emit ReserveDonated(msg.sender, msg.value);
     }
 
@@ -203,6 +229,34 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
         emit ERC20Rescued(address(erc20), to, amount);
     }
 
+    /// @notice Ends the listed holders' backed positions, paying each its full floor value (no
+    ///         fee) into `pendingPayout`, from where only the holder can withdraw it. The holders
+    ///         keep their tokens. Each payout is the holder's pro-rata share of the reserve, so the
+    ///         floor of everyone else never moves; force-redeeming the last credit empties the
+    ///         reserve and reopens the epoch. This is the remedy for a floor pinned by a position
+    ///         too small for the residue it carries (see `MIN_POSITION_VALUE`): nobody is ever
+    ///         paid less than the floor, and the owner cannot direct the ETH anywhere but to the
+    ///         holder.
+    function forceRedeem(address[] calldata holders) external onlyOwner {
+        uint256 supply = backedSupply;
+        uint256 reserve_ = _reserve();
+        uint256 escrowed;
+        for (uint256 i; i < holders.length; ++i) {
+            address holder = holders[i];
+            uint256 credit = redeemable[holder];
+            if (credit == 0) revert NoCredit(holder);
+            uint256 payout = credit == supply ? reserve_ : credit.mulDiv(reserve_, supply);
+            redeemable[holder] = 0;
+            supply -= credit;
+            reserve_ -= payout;
+            escrowed += payout;
+            pendingPayout[holder] += payout;
+            emit ForceRedeemed(holder, credit, payout, _floorAfterPayout(reserve_, supply));
+        }
+        backedSupply = supply;
+        totalPendingPayouts += escrowed;
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Public actions
     // ---------------------------------------------------------------------------------------------
@@ -226,7 +280,7 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
         if (msg.value == 0) revert ZeroAmount();
 
         uint256 supply = backedSupply;
-        uint256 reserveBefore = address(this).balance - msg.value;
+        uint256 reserveBefore = _reserve() - msg.value;
         tokensOut = _tokensOut(msg.value, reserveBefore, supply);
         if (tokensOut == 0) revert ZeroOutput();
         if (tokensOut < minTokensOut) revert SlippageExceeded(tokensOut, minTokensOut);
@@ -246,7 +300,9 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
 
     /// @notice Redeems tokens for ETH at the floor price minus the redemption fee. The redemption
     ///         that returns the backed supply to zero pays the whole reserve with no fee: there is
-    ///         no remaining holder for a fee to stay behind for.
+    ///         no remaining holder for a fee to stay behind for. A partial redemption may not
+    ///         leave the caller with a nonzero credit below `minRemainingCredit()`: redeem all of
+    ///         it instead.
     /// @param amount Token base units to redeem; at most `redeemable(msg.sender)`.
     /// @param minEthOut Slippage guard: revert if less ETH would be paid.
     /// @return ethOut Wei paid to the caller.
@@ -257,13 +313,15 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
         if (amount > credit) revert ExceedsRedeemable(credit, amount);
         uint256 supply = backedSupply; // >= credit >= amount: credits always sum to the supply
 
-        uint256 reserve_ = address(this).balance;
+        uint256 reserve_ = _reserve();
         ethOut = _ethOut(amount, reserve_, supply);
         if (ethOut == 0) revert ZeroOutput();
         if (ethOut < minEthOut) revert SlippageExceeded(ethOut, minEthOut);
+        uint256 remainingCredit = credit - amount;
+        _requireNotDust(remainingCredit, reserve_, supply);
 
         uint256 remaining = supply - amount;
-        redeemable[msg.sender] = credit - amount;
+        redeemable[msg.sender] = remainingCredit;
         backedSupply = remaining;
 
         _pullExact(token_, msg.sender, amount);
@@ -274,15 +332,35 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Moves redemption credit to another account, for a holder who passes tokens on and
-    ///         wants the floor guarantee to travel with them. Moves no tokens.
+    ///         wants the floor guarantee to travel with them. Moves no tokens. Neither side may be
+    ///         left with a nonzero credit below `minRemainingCredit()`.
     function transferRedeemable(address to, uint256 amount) external {
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
         uint256 credit = redeemable[msg.sender];
         if (amount > credit) revert ExceedsRedeemable(credit, amount);
-        redeemable[msg.sender] = credit - amount;
-        redeemable[to] += amount;
+        uint256 supply = backedSupply;
+        uint256 reserve_ = _reserve();
+        uint256 remainingCredit = credit - amount;
+        _requireNotDust(remainingCredit, reserve_, supply);
+        redeemable[msg.sender] = remainingCredit;
+        uint256 received = redeemable[to] + amount; // read after the debit: a self-transfer is a no-op
+        _requireNotDust(received, reserve_, supply);
+        redeemable[to] = received;
         emit RedeemableTransferred(msg.sender, to, amount);
+    }
+
+    /// @notice Pays out what a forced redemption left in escrow for the caller.
+    /// @param to Recipient of the ETH; lets a contract holder that cannot receive ETH name one.
+    function withdrawPayout(address to) external nonReentrant returns (uint256 amount) {
+        if (to == address(0)) revert ZeroAddress();
+        amount = pendingPayout[msg.sender];
+        if (amount == 0) revert NothingToWithdraw();
+        pendingPayout[msg.sender] = 0;
+        totalPendingPayouts -= amount;
+        emit PayoutWithdrawn(msg.sender, to, amount);
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert EthTransferFailed();
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -294,9 +372,18 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
         return address(_token);
     }
 
-    /// @notice ETH backing the outstanding supply, in wei.
+    /// @notice ETH backing the outstanding supply, in wei: the balance less payouts in escrow.
     function reserve() public view returns (uint256) {
-        return address(this).balance;
+        return _reserve();
+    }
+
+    /// @notice Smallest nonzero credit a partial redemption or a credit transfer may leave an
+    ///         account with right now: the credit worth `MIN_POSITION_VALUE` at the floor. Zero
+    ///         while nothing is outstanding. A position may always be redeemed in full.
+    function minRemainingCredit() public view returns (uint256) {
+        uint256 supply = backedSupply;
+        if (supply == 0) return 0;
+        return _minRemainingCredit(_reserve(), supply);
     }
 
     /// @notice Token base units held by the vault and available for sale.
@@ -316,7 +403,7 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     function floorPrice() public view returns (uint256) {
         uint256 supply = backedSupply;
         if (supply == 0) return openingPrice;
-        return address(this).balance.mulDiv(WAD, supply);
+        return _reserve().mulDiv(WAD, supply);
     }
 
     /// @notice Price a buyer pays, in wei per 1e18 base units: floor plus premium, or the opening
@@ -324,7 +411,7 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     function askPrice() public view returns (uint256) {
         uint256 supply = backedSupply;
         if (supply == 0) return openingPrice;
-        return address(this).balance.mulDiv(WAD * (BPS + buyPremiumBps), supply * BPS);
+        return _reserve().mulDiv(WAD * (BPS + buyPremiumBps), supply * BPS);
     }
 
     /// @notice Price a seller receives, in wei per 1e18 base units (floor minus fee); 0 while
@@ -337,7 +424,7 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     /// @notice Token base units `ethIn` wei would buy right now, ignoring inventory limits.
     function quoteBuy(uint256 ethIn) external view returns (uint256) {
         if (openingPrice == 0 && backedSupply == 0) return 0;
-        return _tokensOut(ethIn, address(this).balance, backedSupply);
+        return _tokensOut(ethIn, _reserve(), backedSupply);
     }
 
     /// @notice Wei the caller would receive for redeeming `amount` base units right now; 0 if the
@@ -351,7 +438,7 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     ///         account's credit does not cover it.
     function quoteSellFor(address account, uint256 amount) public view returns (uint256) {
         if (amount == 0 || amount > redeemable[account]) return 0;
-        return _ethOut(amount, address(this).balance, backedSupply);
+        return _ethOut(amount, _reserve(), backedSupply);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -377,6 +464,28 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     function _floorAfterPayout(uint256 reserve_, uint256 supply) internal view returns (uint256) {
         if (supply == 0) return openingPrice;
         return reserve_.mulDiv(WAD, supply);
+    }
+
+    /// @dev The balance less the escrowed payouts, which belong to force-redeemed holders.
+    function _reserve() internal view returns (uint256) {
+        return address(this).balance - totalPendingPayouts;
+    }
+
+    /// @dev Credit worth `MIN_POSITION_VALUE` at the floor `reserve_ / supply`, rounded up. The
+    ///      reserve is never zero while something is outstanding (every buy adds ETH and no partial
+    ///      payout takes all of it); the guard only keeps the view total.
+    function _minRemainingCredit(uint256 reserve_, uint256 supply) internal pure returns (uint256) {
+        if (reserve_ == 0) return type(uint256).max;
+        return MIN_POSITION_VALUE.mulDiv(supply, reserve_, Math.Rounding.Ceil);
+    }
+
+    /// @dev A position left behind must be empty or worth at least `MIN_POSITION_VALUE` at the
+    ///      floor before the operation, so fee and rounding residue can never be concentrated
+    ///      onto dust.
+    function _requireNotDust(uint256 credit, uint256 reserve_, uint256 supply) internal pure {
+        if (credit == 0) return;
+        uint256 min = _minRemainingCredit(reserve_, supply);
+        if (credit < min) revert PositionTooSmall(credit, min);
     }
 
     function _requireToken() internal view returns (IERC20 token_) {

@@ -21,6 +21,9 @@ contract VaultHandler is Test {
     uint256 public buys;
     uint256 public sells;
     uint256 public fullRedemptions;
+    uint256 public forcedRedemptions;
+    /// @dev Token base units force-redeemed holders kept: outside the vault but no longer credited.
+    uint256 public uncreditedOutside;
     /// @dev Checks made inside handlers are recorded here, never asserted: with
     ///      `fail_on_revert = false` a reverting handler is silently discarded.
     uint256 public violations;
@@ -71,6 +74,10 @@ contract VaultHandler is Test {
         uint256 amount = bound(fraction, 1, max);
         uint256 quote = vault.quoteSellFor(who, amount);
         if (quote == 0) return;
+        uint256 remaining = credit - amount;
+        if (remaining != 0 && remaining < vault.minRemainingCredit()) amount = credit; // no dust left behind
+        if (amount > balance) return;
+        quote = vault.quoteSellFor(who, amount);
         vm.startPrank(who);
         token.approve(address(vault), amount);
         uint256 out = vault.sell(amount, quote);
@@ -88,6 +95,9 @@ contract VaultHandler is Test {
         uint256 credit = vault.redeemable(from);
         if (credit == 0) return;
         amount = bound(amount, 1, credit);
+        uint256 min = vault.minRemainingCredit();
+        if (credit - amount != 0 && credit - amount < min) amount = credit;
+        if (vault.redeemable(to) + amount < min) return;
         vm.startPrank(from);
         vault.transferRedeemable(to, amount);
         uint256 balance = token.balanceOf(from);
@@ -99,14 +109,50 @@ contract VaultHandler is Test {
         address who = _actor(seed);
         amount = bound(amount, 1, 10 ether);
         vm.deal(who, who.balance + amount);
-        bool outstanding = vault.backedSupply() != 0;
+        bool accepted = vault.backedSupply() != 0 && vault.reserve() >= vault.MIN_POSITION_VALUE();
         vm.prank(who);
         (bool ok,) = address(vault).call{value: amount}("");
-        // Donations are accepted exactly while something is outstanding.
-        if (ok != outstanding) violations++;
+        // Donations are accepted exactly while something is outstanding and the reserve is not dust.
+        if (ok != accepted) violations++;
         if (!ok) return;
         ethIn += amount;
         _recordFloor();
+    }
+
+    /// @dev The owner ends an actor's position at the floor; the others' floor must not fall and
+    ///      the payout waits in escrow for the holder.
+    function forceRedeem(uint256 seed) external {
+        address who = _actor(seed);
+        uint256 credit = vault.redeemable(who);
+        if (credit == 0) return;
+        uint256 supply = vault.backedSupply();
+        uint256 reserve = vault.reserve();
+        uint256 floorBefore = vault.floorPrice();
+        uint256 pendingBefore = vault.pendingPayout(who);
+        address[] memory holders = new address[](1);
+        holders[0] = who;
+        vm.prank(owner);
+        vault.forceRedeem(holders);
+        uint256 payout = vault.pendingPayout(who) - pendingBefore;
+        if (credit == supply ? payout != reserve : payout > credit * floorBefore / 1e18 + credit / 1e18 + 1) {
+            violations++;
+        }
+        if (vault.backedSupply() != 0 && vault.floorPrice() < floorBefore) violations++;
+        if (vault.redeemable(who) != 0) violations++;
+        uncreditedOutside += credit;
+        forcedRedemptions++;
+        if (vault.backedSupply() == 0) fullRedemptions++;
+        _recordFloor();
+    }
+
+    function withdrawPayout(uint256 seed) external {
+        address who = _actor(seed);
+        uint256 pending = vault.pendingPayout(who);
+        if (pending == 0) return;
+        vm.prank(who);
+        uint256 out = vault.withdrawPayout(who);
+        if (out != pending || vault.pendingPayout(who) != 0) violations++;
+        ethOut += out;
     }
 
     function deposit(uint256 amount) external {
@@ -198,19 +244,28 @@ contract RisingFloorVaultInvariantTest is Test {
         assertEq(handler.violations(), 0);
     }
 
-    /// @dev ETH is conserved: the reserve is exactly what came in minus what redemptions paid out.
+    /// @dev ETH is conserved: the balance is exactly what came in minus what left, the escrow is
+    ///      exactly the sum of the holders' pending payouts, and the reserve is the rest.
     function invariant_ethConservation() public view {
-        assertEq(vault.reserve(), handler.ethIn() - handler.ethOut());
+        assertEq(address(vault).balance, handler.ethIn() - handler.ethOut());
+        uint256 pending;
+        for (uint256 i; i < handler.actorCount(); ++i) {
+            pending += vault.pendingPayout(handler.actor(i));
+        }
+        assertEq(vault.totalPendingPayouts(), pending);
+        assertEq(vault.pendingPayout(OWNER), 0);
+        assertEq(vault.reserve(), address(vault).balance - pending);
     }
 
-    /// @dev Every token outside the vault was sold by it: the backed supply is exactly the sum of
-    ///      actor balances, and the vault's own balance is the rest.
+    /// @dev Every token outside the vault was sold by it: the backed supply plus what forced
+    ///      redemptions left uncredited is exactly the sum of actor balances, and the vault's own
+    ///      balance is the rest.
     function invariant_tokenConservation() public view {
         uint256 outside;
         for (uint256 i; i < handler.actorCount(); ++i) {
             outside += token.balanceOf(handler.actor(i));
         }
-        assertEq(vault.backedSupply(), outside);
+        assertEq(vault.backedSupply() + handler.uncreditedOutside(), outside);
         assertEq(token.balanceOf(address(vault)) + outside + token.balanceOf(OWNER), token.totalSupply());
         assertEq(token.balanceOf(OWNER), handler.inventoryOut());
     }
