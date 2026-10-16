@@ -16,14 +16,20 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///
 ///     floorPrice = reserve * 1e18 / backedSupply        (wei per 1e18 token base units)
 ///
-/// and `backedSupply` is the amount of token the vault has sold and not yet bought back. Every
-/// operation keeps the inequality `floorAfter >= floorBefore`:
+/// and `backedSupply` is the amount of token the vault has sold and not yet bought back. Every buy
+/// credits the buyer with the right to redeem exactly the tokens it sold them (`redeemable`), and
+/// only that credit can be redeemed: tokens that never passed through a vault sale, including
+/// inventory the owner withdraws, have no claim on the reserve. While any backed token is
+/// outstanding every operation keeps the inequality `floorAfter >= floorBefore`:
 ///   * a buy adds ETH at or above the floor, so the average backing per token rises;
 ///   * a sell removes ETH at or below the floor, so the average backing per token rises;
 ///   * a donation adds ETH and removes nothing.
 /// Nobody, including the owner, can withdraw ETH from the reserve: the only way ETH leaves is a
-/// redemption at the floor. Redemptions can never be paused. When every backed token has been
-/// redeemed, the vault reopens at no less than the highest floor it reached.
+/// redemption by a credited holder. Redemptions can never be paused. The redemption that returns
+/// the backed supply to zero pays out the whole reserve, so the reserve is empty whenever nothing
+/// is outstanding and ETH is refused in that state: nothing is ever priced into nobody's tokens.
+/// The owner sets the opening price of each epoch and can never set it below an opening price at
+/// which the vault has already sold.
 ///
 /// The token is launched after this contract, so its address is set once by the owner through
 /// `setToken`; every token feature is disabled until then.
@@ -55,7 +61,8 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
 
     /// @notice Ask price used while no backed token is outstanding (wei per 1e18 base units).
     uint256 public openingPrice;
-    /// @notice Lowest value `openingPrice` may be set to: the highest floor ever reached.
+    /// @notice Lowest value `openingPrice` may be set to: the highest opening price at which the
+    ///         vault has actually sold. Only owner-set values ever land here, so nobody can inflate it.
     uint256 public minOpeningPrice;
     /// @notice Premium charged over the floor on buys, in basis points.
     uint256 public buyPremiumBps;
@@ -67,6 +74,9 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     bool public buysPaused;
     /// @notice Token base units sold by the vault and not yet redeemed; what the reserve backs.
     uint256 public backedSupply;
+    /// @notice Token base units each account may redeem: credited by `buy`, spent by `sell`,
+    ///         movable with `transferRedeemable`. The credits always sum to `backedSupply`.
+    mapping(address account => uint256) public redeemable;
 
     // ---------------------------------------------------------------------------------------------
     // Events
@@ -78,6 +88,7 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     event BuysPausedSet(bool paused);
     event Bought(address indexed buyer, uint256 ethIn, uint256 tokensOut, uint256 floorAfter);
     event Sold(address indexed seller, uint256 tokensIn, uint256 ethOut, uint256 floorAfter);
+    event RedeemableTransferred(address indexed from, address indexed to, uint256 amount);
     event ReserveDonated(address indexed from, uint256 amount);
     event InventoryDeposited(address indexed from, uint256 amount);
     event InventoryWithdrawn(address indexed to, uint256 amount);
@@ -90,17 +101,19 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     error ZeroAddress();
     error ZeroAmount();
     error ZeroOutput();
+    error NotAContract(address token);
     error TokenAlreadySet();
     error TokenNotSet();
+    error NothingOutstanding();
     error OpeningPriceNotSet();
     error SpreadsNotSet();
     error BuysArePaused();
     error PremiumTooHigh(uint256 requested, uint256 max);
     error FeeTooHigh(uint256 requested, uint256 max);
     error SupplyOutstanding(uint256 backedSupply);
-    error OpeningPriceBelowFloor(uint256 requested, uint256 min);
+    error OpeningPriceBelowMinimum(uint256 requested, uint256 min);
     error InsufficientInventory(uint256 available, uint256 requested);
-    error ExceedsBackedSupply(uint256 backedSupply, uint256 requested);
+    error ExceedsRedeemable(uint256 redeemable, uint256 requested);
     error SlippageExceeded(uint256 actual, uint256 min);
     error NonStandardTokenTransfer(uint256 expected, uint256 received);
     error EthTransferFailed();
@@ -113,8 +126,11 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     /// @param owner_ The owner of the vault. Never the deployer: the launch factory deploys this.
     constructor(address owner_) Ownable(owner_) {}
 
-    /// @notice Plain ETH transfers are donations to the reserve and raise the floor.
+    /// @notice Plain ETH transfers are donations to the reserve and raise the floor for the holders
+    ///         credited at that moment. Refused while nothing is outstanding: ETH held with no
+    ///         backed token would otherwise be captured by the next buyer, whatever they pay.
     receive() external payable {
+        if (backedSupply == 0) revert NothingOutstanding();
         emit ReserveDonated(msg.sender, msg.value);
     }
 
@@ -122,23 +138,32 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     // Owner configuration
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice Sets the project token once. Reverts if already set or if `token_` is zero.
+    /// @notice Sets the project token once. Reverts if already set, if `token_` is zero or if
+    ///         `token_` has no code: the slot is one-shot, so a wrong address would be permanent.
     function setToken(address token_) external onlyOwner {
         if (token_ == address(0)) revert ZeroAddress();
+        if (token_.code.length == 0) revert NotAContract(token_);
         if (address(_token) != address(0)) revert TokenAlreadySet();
         _token = IERC20(token_);
         emit TokenSet(token_);
     }
 
     /// @notice Sets the ask price used while nothing is outstanding, in wei per 1e18 base units.
-    /// @dev Only while `backedSupply == 0`, and never below the highest floor already reached, so a
-    ///      reopened vault cannot undercut the price its past buyers were guaranteed.
+    /// @dev Only while `backedSupply == 0`, and never below an opening price the vault has already
+    ///      sold at (`minOpeningPrice`), so the vault's own sale price never goes down across epochs.
     function setOpeningPrice(uint256 price) external onlyOwner {
         if (price == 0) revert ZeroAmount();
         if (backedSupply != 0) revert SupplyOutstanding(backedSupply);
-        if (price < minOpeningPrice) revert OpeningPriceBelowFloor(price, minOpeningPrice);
+        if (price < minOpeningPrice) revert OpeningPriceBelowMinimum(price, minOpeningPrice);
         openingPrice = price;
         emit OpeningPriceSet(price);
+    }
+
+    /// @notice Renouncing before the token slot is filled would leave the slot empty forever, so
+    ///         it is refused until `setToken` has been called.
+    function renounceOwnership() public override onlyOwner {
+        _requireToken();
+        super.renounceOwnership();
     }
 
     /// @notice Sets the buy premium and the redemption fee, both in basis points and both capped.
@@ -158,7 +183,8 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Moves unsold inventory out of the vault. Inventory is not part of the backing, so
-    ///         this never changes the floor.
+    ///         this never changes the floor, and withdrawn tokens carry no redemption credit, so
+    ///         they cannot be turned into reserve ETH.
     function withdrawInventory(address to, uint256 amount) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
@@ -199,27 +225,37 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
         if (buysPaused) revert BuysArePaused();
         if (msg.value == 0) revert ZeroAmount();
 
+        uint256 supply = backedSupply;
         uint256 reserveBefore = address(this).balance - msg.value;
-        tokensOut = _tokensOut(msg.value, reserveBefore, backedSupply);
+        tokensOut = _tokensOut(msg.value, reserveBefore, supply);
         if (tokensOut == 0) revert ZeroOutput();
         if (tokensOut < minTokensOut) revert SlippageExceeded(tokensOut, minTokensOut);
         uint256 available = token_.balanceOf(address(this));
         if (tokensOut > available) revert InsufficientInventory(available, tokensOut);
 
-        backedSupply += tokensOut;
+        if (supply == 0) {
+            // An epoch opens at `openingPrice`; the vault may never reopen below a price it sold at.
+            uint256 opening = openingPrice;
+            if (opening > minOpeningPrice) minOpeningPrice = opening;
+        }
+        backedSupply = supply + tokensOut;
+        redeemable[msg.sender] += tokensOut;
         token_.safeTransfer(msg.sender, tokensOut);
         emit Bought(msg.sender, msg.value, tokensOut, floorPrice());
     }
 
-    /// @notice Redeems tokens for ETH at the floor price minus the redemption fee.
-    /// @param amount Token base units to redeem; at most `backedSupply`.
+    /// @notice Redeems tokens for ETH at the floor price minus the redemption fee. The redemption
+    ///         that returns the backed supply to zero pays the whole reserve with no fee: there is
+    ///         no remaining holder for a fee to stay behind for.
+    /// @param amount Token base units to redeem; at most `redeemable(msg.sender)`.
     /// @param minEthOut Slippage guard: revert if less ETH would be paid.
     /// @return ethOut Wei paid to the caller.
     function sell(uint256 amount, uint256 minEthOut) external nonReentrant returns (uint256 ethOut) {
         IERC20 token_ = _requireToken();
         if (amount == 0) revert ZeroAmount();
-        uint256 supply = backedSupply;
-        if (amount > supply) revert ExceedsBackedSupply(supply, amount);
+        uint256 credit = redeemable[msg.sender];
+        if (amount > credit) revert ExceedsRedeemable(credit, amount);
+        uint256 supply = backedSupply; // >= credit >= amount: credits always sum to the supply
 
         uint256 reserve_ = address(this).balance;
         ethOut = _ethOut(amount, reserve_, supply);
@@ -227,22 +263,26 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
         if (ethOut < minEthOut) revert SlippageExceeded(ethOut, minEthOut);
 
         uint256 remaining = supply - amount;
+        redeemable[msg.sender] = credit - amount;
         backedSupply = remaining;
-        if (remaining == 0) {
-            // The vault is empty of backed tokens; it may reopen only at or above this floor.
-            uint256 floorBefore = reserve_.mulDiv(WAD, supply);
-            if (floorBefore > minOpeningPrice) minOpeningPrice = floorBefore;
-            if (floorBefore > openingPrice) {
-                openingPrice = floorBefore;
-                emit OpeningPriceSet(floorBefore);
-            }
-        }
 
         _pullExact(token_, msg.sender, amount);
         // All state is final here; the floor reported is the one after this redemption settles.
         emit Sold(msg.sender, amount, ethOut, _floorAfterPayout(reserve_ - ethOut, remaining));
         (bool ok,) = msg.sender.call{value: ethOut}("");
         if (!ok) revert EthTransferFailed();
+    }
+
+    /// @notice Moves redemption credit to another account, for a holder who passes tokens on and
+    ///         wants the floor guarantee to travel with them. Moves no tokens.
+    function transferRedeemable(address to, uint256 amount) external {
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        uint256 credit = redeemable[msg.sender];
+        if (amount > credit) revert ExceedsRedeemable(credit, amount);
+        redeemable[msg.sender] = credit - amount;
+        redeemable[to] += amount;
+        emit RedeemableTransferred(msg.sender, to, amount);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -271,22 +311,26 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Guaranteed redemption price before fee, in wei per 1e18 base units.
-    /// @dev While nothing is outstanding this is the opening price the next buyer pays.
+    /// @dev While nothing is outstanding this is the opening price the next buyer pays, which is
+    ///      the floor their tokens will have; nothing is redeemable in that state (see `bidPrice`).
     function floorPrice() public view returns (uint256) {
         uint256 supply = backedSupply;
         if (supply == 0) return openingPrice;
         return address(this).balance.mulDiv(WAD, supply);
     }
 
-    /// @notice Price a buyer pays, in wei per 1e18 base units (floor plus premium).
+    /// @notice Price a buyer pays, in wei per 1e18 base units: floor plus premium, or the opening
+    ///         price with no premium while nothing is outstanding.
     function askPrice() public view returns (uint256) {
         uint256 supply = backedSupply;
         if (supply == 0) return openingPrice;
         return address(this).balance.mulDiv(WAD * (BPS + buyPremiumBps), supply * BPS);
     }
 
-    /// @notice Price a seller receives, in wei per 1e18 base units (floor minus fee).
+    /// @notice Price a seller receives, in wei per 1e18 base units (floor minus fee); 0 while
+    ///         nothing is outstanding, since nothing can be redeemed then.
     function bidPrice() public view returns (uint256) {
+        if (backedSupply == 0) return 0;
         return floorPrice().mulDiv(BPS - sellFeeBps, BPS);
     }
 
@@ -296,11 +340,18 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
         return _tokensOut(ethIn, address(this).balance, backedSupply);
     }
 
-    /// @notice Wei paid for redeeming `amount` base units right now; 0 if above the backed supply.
+    /// @notice Wei the caller would receive for redeeming `amount` base units right now; 0 if the
+    ///         caller's credit does not cover it. Off-chain readers pass the account as `from`, or
+    ///         use `quoteSellFor`.
     function quoteSell(uint256 amount) external view returns (uint256) {
-        uint256 supply = backedSupply;
-        if (amount == 0 || amount > supply) return 0;
-        return _ethOut(amount, address(this).balance, supply);
+        return quoteSellFor(msg.sender, amount);
+    }
+
+    /// @notice Wei `account` would receive for redeeming `amount` base units right now; 0 if the
+    ///         account's credit does not cover it.
+    function quoteSellFor(address account, uint256 amount) public view returns (uint256) {
+        if (amount == 0 || amount > redeemable[account]) return 0;
+        return _ethOut(amount, address(this).balance, backedSupply);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -315,7 +366,10 @@ contract RisingFloorVault is Ownable2Step, ReentrancyGuard {
     }
 
     /// @dev ETH for `amount` tokens at the floor minus the fee. Rounds down in favour of the reserve.
+    ///      Redeeming the entire backed supply pays the entire reserve: fees and rounding residue
+    ///      belong to the remaining holders, and there are none.
     function _ethOut(uint256 amount, uint256 reserve_, uint256 supply) internal view returns (uint256) {
+        if (amount == supply) return reserve_;
         return (amount * (BPS - sellFeeBps)).mulDiv(reserve_, supply * BPS);
     }
 

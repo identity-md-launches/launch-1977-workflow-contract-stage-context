@@ -301,6 +301,49 @@
   },
   {
     "type": "function",
+    "name": "quoteSellFor",
+    "inputs": [
+      {
+        "name": "account",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "redeemable",
+    "inputs": [
+      {
+        "name": "account",
+        "type": "address",
+        "internalType": "address"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "renounceOwnership",
     "inputs": [],
     "outputs": [],
@@ -470,6 +513,24 @@
         "name": "newOwner",
         "type": "address",
         "internalType": "address"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "transferRedeemable",
+    "inputs": [
+      {
+        "name": "to",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "outputs": [],
@@ -653,6 +714,31 @@
   },
   {
     "type": "event",
+    "name": "RedeemableTransferred",
+    "inputs": [
+      {
+        "name": "from",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "to",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      },
+      {
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "ReserveDonated",
     "inputs": [
       {
@@ -745,10 +831,10 @@
   },
   {
     "type": "error",
-    "name": "ExceedsBackedSupply",
+    "name": "ExceedsRedeemable",
     "inputs": [
       {
-        "name": "backedSupply",
+        "name": "redeemable",
         "type": "uint256",
         "internalType": "uint256"
       },
@@ -809,7 +895,23 @@
   },
   {
     "type": "error",
-    "name": "OpeningPriceBelowFloor",
+    "name": "NotAContract",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "NothingOutstanding",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "OpeningPriceBelowMinimum",
     "inputs": [
       {
         "name": "requested",

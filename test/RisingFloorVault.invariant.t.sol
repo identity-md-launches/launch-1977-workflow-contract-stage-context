@@ -21,6 +21,9 @@ contract VaultHandler is Test {
     uint256 public buys;
     uint256 public sells;
     uint256 public fullRedemptions;
+    /// @dev Checks made inside handlers are recorded here, never asserted: with
+    ///      `fail_on_revert = false` a reverting handler is silently discarded.
+    uint256 public violations;
 
     constructor(RisingFloorVault vault_, MockERC20 token_, address owner_) {
         vault = vault_;
@@ -35,7 +38,13 @@ contract VaultHandler is Test {
         return actors[seed % actors.length];
     }
 
+    /// @dev The high-water mark is an epoch's: while anything is outstanding the floor may only
+    ///      rise; a full redemption pays everyone and the next epoch starts at the opening price.
     function _recordFloor() internal {
+        if (vault.backedSupply() == 0) {
+            floorHighWater = vault.openingPrice();
+            return;
+        }
         uint256 f = vault.floorPrice();
         if (f > floorHighWater) floorHighWater = f;
     }
@@ -56,10 +65,11 @@ contract VaultHandler is Test {
     function sell(uint256 seed, uint256 fraction) external {
         address who = _actor(seed);
         uint256 balance = token.balanceOf(who);
-        if (balance == 0) return;
-        uint256 amount = bound(fraction, 1, balance);
-        if (amount > vault.backedSupply()) amount = vault.backedSupply();
-        uint256 quote = vault.quoteSell(amount);
+        uint256 credit = vault.redeemable(who);
+        uint256 max = balance < credit ? balance : credit;
+        if (max == 0) return;
+        uint256 amount = bound(fraction, 1, max);
+        uint256 quote = vault.quoteSellFor(who, amount);
         if (quote == 0) return;
         vm.startPrank(who);
         token.approve(address(vault), amount);
@@ -71,13 +81,30 @@ contract VaultHandler is Test {
         _recordFloor();
     }
 
+    /// @dev Credit may move without tokens and vice versa; redemption needs both.
+    function transferCredit(uint256 seedFrom, uint256 seedTo, uint256 amount, bool withTokens) external {
+        address from = _actor(seedFrom);
+        address to = _actor(seedTo + 1);
+        uint256 credit = vault.redeemable(from);
+        if (credit == 0) return;
+        amount = bound(amount, 1, credit);
+        vm.startPrank(from);
+        vault.transferRedeemable(to, amount);
+        uint256 balance = token.balanceOf(from);
+        if (withTokens && balance != 0) token.transfer(to, amount < balance ? amount : balance);
+        vm.stopPrank();
+    }
+
     function donate(uint256 seed, uint256 amount) external {
         address who = _actor(seed);
         amount = bound(amount, 1, 10 ether);
         vm.deal(who, who.balance + amount);
+        bool outstanding = vault.backedSupply() != 0;
         vm.prank(who);
         (bool ok,) = address(vault).call{value: amount}("");
-        require(ok, "donation failed");
+        // Donations are accepted exactly while something is outstanding.
+        if (ok != outstanding) violations++;
+        if (!ok) return;
         ethIn += amount;
         _recordFloor();
     }
@@ -90,13 +117,22 @@ contract VaultHandler is Test {
         inventoryIn += amount;
     }
 
+    /// @dev The owner moves inventory out and then tries to redeem it: that must always fail, so
+    ///      withdrawing inventory is never a route to the reserve.
     function withdraw(uint256 amount) external {
         uint256 available = vault.inventory();
         if (available == 0) return;
         amount = bound(amount, 1, available);
-        vm.prank(owner);
+        vm.startPrank(owner);
         vault.withdrawInventory(owner, amount);
         inventoryOut += amount;
+        token.approve(address(vault), amount);
+        try vault.sell(amount, 0) {
+            violations++; // the owner redeemed withdrawn inventory
+        } catch (bytes memory err) {
+            if (bytes4(err) != RisingFloorVault.ExceedsRedeemable.selector) violations++;
+        }
+        vm.stopPrank();
     }
 
     function setSpreads(uint256 premium, uint256 fee) external {
@@ -147,11 +183,19 @@ contract RisingFloorVaultInvariantTest is Test {
         targetContract(address(handler));
     }
 
-    /// @dev The headline guarantee: the quoted floor never goes below any floor seen before.
+    /// @dev The headline guarantee: within an epoch the quoted floor never goes below any floor seen
+    ///      before, and the opening price never goes below one the vault sold at.
     function invariant_floorNeverFalls() public view {
         assertGe(vault.floorPrice(), handler.floorHighWater());
         assertGe(vault.openingPrice(), OPENING);
         assertGe(vault.openingPrice(), vault.minOpeningPrice());
+        assertLe(vault.minOpeningPrice(), OPENING); // only the price actually sold at is recorded
+    }
+
+    /// @dev Checks the handlers made along the way: donations refused exactly while nothing is
+    ///      outstanding, and the owner's withdrawn inventory never redeemable.
+    function invariant_handlerChecksHold() public view {
+        assertEq(handler.violations(), 0);
     }
 
     /// @dev ETH is conserved: the reserve is exactly what came in minus what redemptions paid out.
@@ -171,11 +215,37 @@ contract RisingFloorVaultInvariantTest is Test {
         assertEq(token.balanceOf(OWNER), handler.inventoryOut());
     }
 
-    /// @dev The reserve can always pay every backed token at the floor: the floor is defined from it.
+    /// @dev Redemption credits always sum to the backed supply, and the owner never holds any.
+    function invariant_creditsSumToBackedSupply() public view {
+        uint256 credits;
+        for (uint256 i; i < handler.actorCount(); ++i) {
+            credits += vault.redeemable(handler.actor(i));
+        }
+        assertEq(credits, vault.backedSupply());
+        assertEq(vault.redeemable(OWNER), 0);
+    }
+
+    /// @dev The reserve pays every backed token: redeeming the whole supply takes exactly the
+    ///      reserve, and nothing is left behind once nothing is outstanding.
     function invariant_reserveCoversRedemptions() public view {
         uint256 supply = vault.backedSupply();
-        if (supply == 0) return;
-        assertGt(vault.reserve(), 0);
-        assertLe(vault.quoteSell(supply), vault.reserve());
+        if (supply == 0) {
+            assertEq(vault.reserve(), 0);
+            assertEq(vault.bidPrice(), 0);
+            return;
+        }
+        uint256 reserve = vault.reserve();
+        assertGt(reserve, 0);
+        uint256 total;
+        for (uint256 i; i < handler.actorCount(); ++i) {
+            address who = handler.actor(i);
+            uint256 credit = vault.redeemable(who);
+            if (credit == 0) continue;
+            uint256 quote = vault.quoteSellFor(who, credit);
+            assertLe(quote, reserve);
+            if (credit == supply) assertEq(quote, reserve);
+            total += quote;
+        }
+        assertLe(total, reserve);
     }
 }

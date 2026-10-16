@@ -36,6 +36,7 @@ contract RisingFloorVaultTest is Test {
     event BuysPausedSet(bool paused);
     event Bought(address indexed buyer, uint256 ethIn, uint256 tokensOut, uint256 floorAfter);
     event Sold(address indexed seller, uint256 tokensIn, uint256 ethOut, uint256 floorAfter);
+    event RedeemableTransferred(address indexed from, address indexed to, uint256 amount);
     event ReserveDonated(address indexed from, uint256 amount);
     event InventoryDeposited(address indexed from, uint256 amount);
     event InventoryWithdrawn(address indexed to, uint256 amount);
@@ -134,6 +135,35 @@ contract RisingFloorVaultTest is Test {
         vault.setToken(address(0));
     }
 
+    function test_setToken_rejectsAddressWithoutCode() public {
+        address noCode = address(0x1234);
+        assertEq(noCode.code.length, 0);
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.NotAContract.selector, noCode));
+        vault.setToken(noCode);
+        // The slot is still open for the real token.
+        vm.prank(OWNER);
+        vault.setToken(address(token));
+        assertEq(vault.token(), address(token));
+    }
+
+    function test_renounceOwnership_refusedUntilTokenIsSet() public {
+        vm.prank(OWNER);
+        vm.expectRevert(RisingFloorVault.TokenNotSet.selector);
+        vault.renounceOwnership();
+        assertEq(vault.owner(), OWNER);
+
+        _expectOnlyOwner(ALICE);
+        vm.prank(ALICE);
+        vault.renounceOwnership();
+
+        vm.startPrank(OWNER);
+        vault.setToken(address(token));
+        vault.renounceOwnership();
+        vm.stopPrank();
+        assertEq(vault.owner(), address(0));
+    }
+
     function test_setToken_storesAndEmits() public {
         vm.expectEmit(true, false, false, true, address(vault));
         emit TokenSet(address(token));
@@ -219,6 +249,89 @@ contract RisingFloorVaultTest is Test {
         vm.prank(OWNER);
         vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.SupplyOutstanding.selector, supply));
         vault.setOpeningPrice(OPENING * 2);
+    }
+
+    /// @dev The first sale of an epoch records its opening price as the minimum for every later
+    ///      epoch: the vault's own sale price never goes down, and only owner-set values are recorded.
+    function test_openingPrice_neverBelowAPriceTheVaultSoldAt() public {
+        _configure();
+        assertEq(vault.minOpeningPrice(), 0);
+        uint256 bought = _buy(ALICE, 1 ether);
+        assertEq(vault.minOpeningPrice(), OPENING);
+        _sell(ALICE, bought);
+        assertEq(vault.backedSupply(), 0);
+        assertEq(vault.openingPrice(), OPENING); // a full redemption does not move the opening price
+        assertEq(vault.minOpeningPrice(), OPENING);
+
+        vm.startPrank(OWNER);
+        vm.expectRevert(
+            abi.encodeWithSelector(RisingFloorVault.OpeningPriceBelowMinimum.selector, OPENING - 1, OPENING)
+        );
+        vault.setOpeningPrice(OPENING - 1);
+        vault.setOpeningPrice(OPENING); // equal is allowed
+        vault.setOpeningPrice(OPENING * 4);
+        vm.stopPrank();
+
+        // Raising it is only locked in once somebody buys at the new price.
+        assertEq(vault.minOpeningPrice(), OPENING);
+        vm.prank(OWNER);
+        vault.setOpeningPrice(OPENING * 2);
+        uint256 bought2 = _buy(BOB, 1 ether);
+        assertEq(bought2, 1 ether * WAD / (OPENING * 2));
+        assertEq(vault.minOpeningPrice(), OPENING * 2);
+        _sell(BOB, bought2);
+        vm.prank(OWNER);
+        vm.expectRevert(
+            abi.encodeWithSelector(RisingFloorVault.OpeningPriceBelowMinimum.selector, OPENING, OPENING * 2)
+        );
+        vault.setOpeningPrice(OPENING);
+    }
+
+    /// @dev A dust buy, a donation against it and a full redemption used to write an astronomic
+    ///      floor into `minOpeningPrice` for the price of the fee. Now the donation comes back whole
+    ///      on the final redemption and the minimum stays at the price the griefer actually bought at.
+    function test_openingPrice_cannotBeLockedByDonationAgainstDust() public {
+        _configure();
+        address griefer = address(0xBAD);
+        vm.deal(griefer, 1 ether);
+        uint256 costBefore = griefer.balance;
+
+        vm.startPrank(griefer);
+        uint256 dust = vault.buy{value: 1}(0);
+        assertEq(dust, 1000); // 1 wei at 0.001 ETH per token
+        (bool ok,) = address(vault).call{value: 0.01 ether}("");
+        assertTrue(ok); // accepted: something is outstanding, the donation goes to its holders
+        assertEq(vault.floorPrice(), (0.01 ether + 1) * WAD / 1000);
+        token.approve(address(vault), dust);
+        uint256 out = vault.sell(dust, 0);
+        vm.stopPrank();
+
+        assertEq(out, 0.01 ether + 1); // the final redemption pays everything back, no fee
+        assertEq(griefer.balance, costBefore);
+        assertEq(vault.reserve(), 0);
+        assertEq(vault.minOpeningPrice(), OPENING);
+        assertEq(vault.openingPrice(), OPENING);
+
+        vm.prank(OWNER);
+        vault.setOpeningPrice(OPENING);
+        assertEq(_buy(ALICE, 1 ether), 1_000e18);
+    }
+
+    /// @dev The other griefing route: a sole holder sells all but one base unit so the fee residue
+    ///      concentrates on it, then redeems that unit. No activity-derived value is ratcheted.
+    function test_openingPrice_cannotBeLockedByConcentratingFeeResidue() public {
+        _configure();
+        uint256 bought = _buy(ALICE, 1 ether);
+        _sell(ALICE, bought - 1);
+        assertEq(vault.backedSupply(), 1);
+        assertGt(vault.floorPrice(), 1e30); // the residue against one base unit: astronomic, and harmless
+        uint256 residue = vault.reserve();
+        uint256 out = _sell(ALICE, 1);
+        assertEq(out, residue);
+        assertEq(vault.reserve(), 0);
+        assertEq(vault.minOpeningPrice(), OPENING);
+        assertEq(vault.openingPrice(), OPENING);
+        assertEq(vault.quoteBuy(1 ether), 1_000e18);
     }
 
     function test_buy_revertsUntilOpeningPriceIsSet() public {
@@ -514,7 +627,7 @@ contract RisingFloorVaultTest is Test {
         uint256 amount = 400e18;
         uint256 expected = (amount * (BPS - FEE)).mulDiv(vault.reserve(), vault.backedSupply() * BPS);
         assertEq(expected, 0.396 ether);
-        assertEq(vault.quoteSell(amount), expected);
+        assertEq(vault.quoteSellFor(ALICE, amount), expected);
 
         uint256 inventoryBefore = vault.inventory();
         uint256 aliceEthBefore = ALICE.balance;
@@ -560,16 +673,57 @@ contract RisingFloorVaultTest is Test {
         vault.sell(0, 0);
     }
 
-    function test_sell_rejectsMoreThanTheBackedSupply() public {
+    function test_sell_rejectsMoreThanTheCallersCredit() public {
         _configure();
         uint256 bought = _buy(ALICE, 1 ether);
-        // Bob holds tokens that never passed through the vault: they are not backed.
-        token.mint(BOB, bought);
-        vm.startPrank(BOB);
+        assertEq(vault.redeemable(ALICE), bought);
+        token.mint(ALICE, 1); // one extra base unit from outside the vault
+        vm.startPrank(ALICE);
         token.approve(address(vault), type(uint256).max);
-        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsBackedSupply.selector, bought, bought + 1));
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, bought, bought + 1));
         vault.sell(bought + 1, 0);
         vm.stopPrank();
+    }
+
+    /// @dev Tokens that never passed through a vault sale carry no claim on the reserve, however
+    ///      many are outstanding: an outside holder cannot take a vault buyer's backing.
+    function test_sell_outsideHolderHasNoCredit() public {
+        _configure();
+        uint256 bought = _buy(ALICE, 1 ether);
+        token.mint(BOB, bought);
+        assertEq(vault.redeemable(BOB), 0);
+        assertEq(vault.quoteSellFor(BOB, bought), 0);
+        assertEq(vault.quoteSellFor(ALICE, bought), 1 ether);
+        vm.startPrank(BOB);
+        token.approve(address(vault), type(uint256).max);
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, 0, bought));
+        vault.sell(bought, 0);
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, 0, 1));
+        vault.sell(1, 0);
+        vm.stopPrank();
+        // Alice's redemption is untouched.
+        assertEq(_sell(ALICE, bought), 1 ether);
+    }
+
+    /// @dev The owner may move unsold inventory out, but that inventory has no credit, so the move
+    ///      is not a two-step ETH withdrawal.
+    function test_sell_ownerCannotRedeemWithdrawnInventory() public {
+        _configure();
+        uint256 aliceTokens = _buy(ALICE, 10 ether);
+        assertEq(vault.reserve(), 10 ether);
+
+        vm.startPrank(OWNER);
+        vault.withdrawInventory(OWNER, aliceTokens);
+        token.approve(address(vault), aliceTokens);
+        assertEq(vault.quoteSellFor(OWNER, aliceTokens), 0);
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, 0, aliceTokens));
+        vault.sell(aliceTokens, 0);
+        vm.stopPrank();
+
+        assertEq(OWNER.balance, 0);
+        assertEq(vault.reserve(), 10 ether);
+        assertEq(vault.redeemable(ALICE), aliceTokens);
+        assertEq(_sell(ALICE, aliceTokens), 10 ether);
     }
 
     function test_sell_revertsBeforeAnythingWasSold() public {
@@ -577,16 +731,89 @@ contract RisingFloorVaultTest is Test {
         token.mint(ALICE, 1e18);
         vm.startPrank(ALICE);
         token.approve(address(vault), 1e18);
-        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsBackedSupply.selector, 0, 1e18));
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, 0, 1e18));
         vault.sell(1e18, 0);
         vm.stopPrank();
+    }
+
+    function test_sell_lastRedemptionPaysTheWholeReserveWithoutFee() public {
+        _configure();
+        uint256 aliceTokens = _buy(ALICE, 1 ether);
+        uint256 bobTokens = _buy(BOB, 1 ether);
+
+        // Alice leaves first: she pays the fee, which stays with Bob.
+        uint256 floorBefore = vault.floorPrice();
+        uint256 aliceOut = _sell(ALICE, aliceTokens);
+        assertLt(aliceOut, aliceTokens * floorBefore / WAD);
+        uint256 residue = vault.reserve();
+        assertEq(residue, 2 ether - aliceOut);
+        assertEq(vault.quoteSellFor(BOB, bobTokens), residue);
+        assertEq(vault.quoteSellFor(BOB, bobTokens - 1), (bobTokens - 1) * (BPS - FEE) * residue / (bobTokens * BPS));
+
+        // Bob is the last holder: there is nobody left for a fee to stay behind for.
+        vm.startPrank(BOB);
+        token.approve(address(vault), bobTokens);
+        vm.expectEmit(true, false, false, true, address(vault));
+        emit Sold(BOB, bobTokens, residue, OPENING);
+        uint256 bobOut = vault.sell(bobTokens, 0);
+        vm.stopPrank();
+        assertEq(bobOut, residue);
+        assertEq(vault.reserve(), 0);
+        assertEq(vault.backedSupply(), 0);
+        assertEq(vault.redeemable(BOB), 0);
+        assertEq(vault.floorPrice(), OPENING);
+        assertEq(vault.bidPrice(), 0);
+    }
+
+    /// @dev The fee is a transfer to whoever still holds credit, the seller included. A sole holder
+    ///      who leaves in two steps therefore recovers everything; this documents, not hides, that
+    ///      the fee only bites when other holders remain.
+    function test_sell_soleHolderTwoStepExitRecoversEverything() public {
+        _configure();
+        uint256 bought = _buy(ALICE, 1 ether);
+        uint256 before = ALICE.balance;
+        _sell(ALICE, bought - 1e18);
+        assertLt(ALICE.balance, before + 1 ether); // the fee stayed behind for the remaining stake
+        _sell(ALICE, 1e18);
+        assertEq(ALICE.balance, before + 1 ether);
+        assertEq(vault.reserve(), 0);
+    }
+
+    function test_transferRedeemable_movesCreditNotTokens() public {
+        _configure();
+        uint256 bought = _buy(ALICE, 1 ether);
+
+        vm.startPrank(ALICE);
+        vm.expectRevert(RisingFloorVault.ZeroAddress.selector);
+        vault.transferRedeemable(address(0), 1);
+        vm.expectRevert(RisingFloorVault.ZeroAmount.selector);
+        vault.transferRedeemable(BOB, 0);
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, bought, bought + 1));
+        vault.transferRedeemable(BOB, bought + 1);
+
+        vm.expectEmit(true, true, false, true, address(vault));
+        emit RedeemableTransferred(ALICE, BOB, 400e18);
+        vault.transferRedeemable(BOB, 400e18);
+        token.transfer(BOB, 400e18);
+        vm.stopPrank();
+
+        assertEq(vault.redeemable(ALICE), bought - 400e18);
+        assertEq(vault.redeemable(BOB), 400e18);
+        assertEq(vault.backedSupply(), bought);
+        assertEq(_sell(BOB, 400e18), 0.396 ether);
+
+        // Bob cannot redeem more than he was given, even though Alice still has credit.
+        vm.prank(BOB);
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, 0, 1));
+        vault.sell(1, 0);
     }
 
     function test_sell_enforcesMinEthOut() public {
         _configure();
         uint256 bought = _buy(ALICE, 1 ether);
-        uint256 quote = vault.quoteSell(bought);
+        uint256 quote = vault.quoteSellFor(ALICE, bought);
         vm.startPrank(ALICE);
+        assertEq(vault.quoteSell(bought), quote); // the caller's own quote
         token.approve(address(vault), bought);
         vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.SlippageExceeded.selector, quote, quote + 1));
         vault.sell(bought, quote + 1);
@@ -625,45 +852,31 @@ contract RisingFloorVaultTest is Test {
         assertEq(token.balanceOf(address(receiver)), bought);
     }
 
-    function test_sell_everythingRatchetsTheOpeningPrice() public {
+    function test_sell_everythingReopensAtTheOwnersOpeningPriceWithAnEmptyReserve() public {
         _configure();
         uint256 aliceTokens = _buy(ALICE, 1 ether);
         uint256 bobTokens = _buy(BOB, 1 ether); // pays the premium: floor rises above OPENING
         uint256 floorBefore = vault.floorPrice();
         assertGt(floorBefore, OPENING);
 
-        _sell(ALICE, aliceTokens);
+        uint256 aliceOut = _sell(ALICE, aliceTokens);
         uint256 floorMid = vault.floorPrice();
         assertGe(floorMid, floorBefore);
 
-        vm.startPrank(BOB);
-        token.approve(address(vault), bobTokens);
-        vm.expectEmit(false, false, false, true, address(vault));
-        emit OpeningPriceSet(floorMid);
-        vault.sell(bobTokens, 0);
-        vm.stopPrank();
-
+        uint256 bobOut = _sell(BOB, bobTokens);
+        assertEq(bobOut, 2 ether - aliceOut); // everything Alice did not take
         assertEq(vault.backedSupply(), 0);
-        assertEq(vault.openingPrice(), floorMid);
-        assertEq(vault.minOpeningPrice(), floorMid);
-        assertEq(vault.floorPrice(), floorMid);
-        // Fees stayed behind as reserve for the next buyers.
-        assertGt(vault.reserve(), 0);
+        assertEq(vault.reserve(), 0);
+        // The opening price is the owner's, not the epoch's final floor; its minimum is what sold.
+        assertEq(vault.openingPrice(), OPENING);
+        assertEq(vault.minOpeningPrice(), OPENING);
+        assertEq(vault.floorPrice(), OPENING);
+        assertEq(vault.bidPrice(), 0);
 
-        // The owner may not reopen below the reached floor, but may go higher.
-        vm.startPrank(OWNER);
-        vm.expectRevert(
-            abi.encodeWithSelector(RisingFloorVault.OpeningPriceBelowFloor.selector, floorMid - 1, floorMid)
-        );
-        vault.setOpeningPrice(floorMid - 1);
-        vault.setOpeningPrice(floorMid + 1);
-        vm.stopPrank();
-        assertEq(vault.openingPrice(), floorMid + 1);
-
-        // The next buyer pays at least that and the leftover reserve lifts the floor further.
+        // The next buyer pays exactly the opening price: nothing pre-existing is priced in.
         uint256 out = _buy(ALICE, 1 ether);
-        assertEq(out, 1 ether * WAD / (floorMid + 1));
-        assertGt(vault.floorPrice(), floorMid + 1);
+        assertEq(out, 1 ether * WAD / OPENING);
+        assertEq(vault.floorPrice(), OPENING);
     }
 
     // ------------------------------------------------------------------ donations
@@ -681,8 +894,57 @@ contract RisingFloorVaultTest is Test {
 
         assertEq(vault.reserve(), 1.5 ether);
         assertEq(vault.floorPrice(), floorBefore * 15 / 10);
-        // Donated ETH is redeemable by holders, never by the owner.
-        assertEq(vault.quoteSell(vault.backedSupply()), 1.5 ether * (BPS - FEE) / BPS);
+        // Donated ETH is redeemable by the credited holders, never by the owner.
+        assertEq(vault.quoteSellFor(ALICE, vault.backedSupply()), 1.5 ether);
+        assertEq(vault.quoteSellFor(ALICE, vault.backedSupply() / 2), 0.75 ether * (BPS - FEE) / BPS);
+    }
+
+    /// @dev ETH held while nothing is outstanding would be captured by the next buyer, so plain
+    ///      transfers are refused in that state: before configuration, before the first sale and
+    ///      again after a full redemption.
+    function test_receive_refusedWhileNothingIsOutstanding() public {
+        vm.deal(address(this), 3 ether);
+        (bool ok, bytes memory err) = address(vault).call{value: 1 ether}("");
+        assertFalse(ok);
+        assertEq(bytes4(err), RisingFloorVault.NothingOutstanding.selector);
+
+        _configure();
+        vm.deal(OWNER, 1 ether);
+        vm.prank(OWNER);
+        (ok, err) = address(vault).call{value: 1 ether}("");
+        assertFalse(ok);
+        assertEq(bytes4(err), RisingFloorVault.NothingOutstanding.selector);
+        assertEq(vault.reserve(), 0);
+        assertEq(OWNER.balance, 1 ether);
+
+        uint256 bought = _buy(ALICE, 1 ether);
+        (ok,) = address(vault).call{value: 1 ether}("");
+        assertTrue(ok);
+        _sell(ALICE, bought);
+        assertEq(vault.reserve(), 0);
+
+        (ok, err) = address(vault).call{value: 1 ether}("");
+        assertFalse(ok);
+        assertEq(bytes4(err), RisingFloorVault.NothingOutstanding.selector);
+    }
+
+    /// @dev A 1 wei buyer of a fresh epoch gets 1 wei of backing and nothing more, whether the
+    ///      previous epoch ended with a fee residue or the owner tried to seed the reserve.
+    function test_buy_firstBuyerOfAnEpochCapturesNothing() public {
+        _configure();
+        uint256 aliceTokens = _buy(ALICE, 1 ether);
+        _sell(ALICE, aliceTokens - 1); // leaves a fee residue against one base unit
+        assertGt(vault.reserve(), 0);
+        _sell(ALICE, 1); // ...which the last redemption pays out
+        assertEq(vault.reserve(), 0);
+
+        uint256 bobBefore = BOB.balance;
+        uint256 bobTokens = _buy(BOB, 1);
+        assertEq(bobTokens, 1000);
+        assertEq(vault.floorPrice(), OPENING);
+        assertEq(vault.quoteSellFor(BOB, bobTokens), 1);
+        _sell(BOB, bobTokens);
+        assertEq(BOB.balance, bobBefore);
     }
 
     function test_noFunctionLetsTheOwnerWithdrawEth() public {
@@ -694,9 +956,38 @@ contract RisingFloorVaultTest is Test {
         vault.setBuysPaused(false);
         vault.setSpreads(0, 0);
         vault.withdrawInventory(OWNER, 1e18);
+        token.approve(address(vault), 1e18);
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, 0, 1e18));
+        vault.sell(1e18, 0);
         vm.stopPrank();
         assertEq(vault.reserve(), 5 ether);
         assertEq(OWNER.balance, 0);
+    }
+
+    // ------------------------------------------------------------------ views
+
+    function test_views_whileNothingIsOutstanding() public {
+        _configure();
+        assertEq(vault.floorPrice(), OPENING);
+        assertEq(vault.askPrice(), OPENING); // the opening sale carries no premium
+        assertEq(vault.bidPrice(), 0); // nothing is redeemable
+        assertEq(vault.quoteSell(1e18), 0);
+        assertEq(vault.quoteSellFor(ALICE, 1e18), 0);
+        assertEq(vault.quoteBuy(1 ether), 1_000e18);
+
+        uint256 bought = _buy(ALICE, 1 ether);
+        assertEq(vault.askPrice(), OPENING * (BPS + PREMIUM) / BPS);
+        assertEq(vault.bidPrice(), OPENING * (BPS - FEE) / BPS);
+        assertEq(vault.quoteSellFor(ALICE, bought), 1 ether);
+        assertEq(vault.quoteSellFor(BOB, 1), 0);
+        // quoteSell is the caller's own quote.
+        vm.prank(ALICE);
+        uint256 aliceQuote = vault.quoteSell(bought / 2);
+        assertEq(aliceQuote, vault.quoteSellFor(ALICE, bought / 2));
+        assertGt(aliceQuote, 0);
+        vm.prank(BOB);
+        uint256 bobQuote = vault.quoteSell(1);
+        assertEq(bobQuote, 0);
     }
 
     // ------------------------------------------------------------------ reentrancy
@@ -721,7 +1012,7 @@ contract RisingFloorVaultTest is Test {
         uint256 bought = vault.buy{value: 2 ether}(0);
 
         uint256 half = bought / 2;
-        uint256 expected = vault.quoteSell(half);
+        uint256 expected = vault.quoteSellFor(address(attacker), half);
         uint256 floorBefore = vault.floorPrice();
 
         attacker.attack(half, half, mode);
@@ -825,7 +1116,7 @@ contract RisingFloorVaultTest is Test {
         if (amount == 0) return;
         uint256 floorBefore = vault.floorPrice();
         uint256 reserveBefore = vault.reserve();
-        uint256 quote = vault.quoteSell(amount);
+        uint256 quote = vault.quoteSellFor(ALICE, amount);
         if (quote == 0) {
             vm.startPrank(ALICE);
             token.approve(address(vault), amount);
@@ -839,11 +1130,56 @@ contract RisingFloorVaultTest is Test {
         assertLe(out, amount.mulDiv(floorBefore, WAD) + 1); // never above the floor
         assertEq(vault.reserve(), reserveBefore - out);
         assertEq(vault.backedSupply(), bought - amount);
-        assertGe(vault.floorPrice(), floorBefore);
+        assertEq(vault.redeemable(ALICE), bought - amount);
         if (vault.backedSupply() == 0) {
-            assertGe(vault.openingPrice(), floorBefore);
-            assertGe(vault.minOpeningPrice(), floorBefore);
+            // The last redemption takes everything; the epoch reopens at the owner's price.
+            assertEq(out, reserveBefore);
+            assertEq(vault.reserve(), 0);
+            assertEq(vault.openingPrice(), OPENING);
+            assertEq(vault.minOpeningPrice(), OPENING);
+        } else {
+            assertGe(vault.floorPrice(), floorBefore);
         }
+    }
+
+    /// @dev Whatever a holder does, once the backed supply is zero the reserve is zero too: no ETH
+    ///      is ever waiting for the next buyer.
+    function testFuzz_emptySupplyMeansEmptyReserve(uint256 ethA, uint256 ethB, uint256 donation, uint256 fee) public {
+        ethA = bound(ethA, 1, 100 ether);
+        ethB = bound(ethB, 1, 100 ether);
+        donation = bound(donation, 0, 100 ether);
+        fee = bound(fee, 0, 1_000);
+        vm.startPrank(OWNER);
+        vault.setToken(address(token));
+        vault.setSpreads(PREMIUM, fee);
+        vault.setOpeningPrice(OPENING);
+        vm.stopPrank();
+        token.mint(address(vault), type(uint128).max);
+
+        uint256 a = _buy(ALICE, ethA);
+        uint256 b;
+        if (vault.quoteBuy(ethB) != 0) b = _buy(BOB, ethB);
+        if (donation != 0) {
+            vm.deal(address(this), donation);
+            (bool ok,) = address(vault).call{value: donation}("");
+            assertTrue(ok);
+        }
+        uint256 reserveBefore = vault.reserve();
+        uint256 aliceOut;
+        uint256 bobOut;
+        if (b != 0 && vault.quoteSellFor(ALICE, a) == 0) {
+            // Alice's position is dust next to Bob's and rounds to nothing: Bob leaves first and
+            // Alice, as the last holder, takes what is left.
+            bobOut = _sell(BOB, b);
+            aliceOut = _sell(ALICE, a);
+        } else {
+            aliceOut = _sell(ALICE, a);
+            if (b != 0) bobOut = _sell(BOB, b);
+        }
+        assertEq(vault.backedSupply(), 0);
+        assertEq(vault.reserve(), 0);
+        assertEq(aliceOut + bobOut, reserveBefore);
+        assertEq(vault.redeemable(ALICE) + vault.redeemable(BOB), 0);
     }
 
     function testFuzz_roundTripNeverProfitsAgainstTheReserve(uint256 ethIn, uint256 premium, uint256 fee) public {
