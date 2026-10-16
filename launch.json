@@ -1,0 +1,10 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "RisingFloorVault",
+      "constructorArgs": ["$owner"]
+    }
+  ],
+  "notes": "Deploys the accepted RisingFloorVault with ownership assigned to $owner, the approved creator wallet 0xd3f26a6be348440110161dfd5748e7de7b08cf69. The factory receives no owner privileges. The token slot starts unset and can be set once by the owner using setToken(address). Purchases require the owner to set the token, opening price and spreads, and require available token inventory. These are application operations, not deployment calls in this manifest. The vault manages an ETH-backed redemption floor for tokens it sells; it does not guarantee an external market price. No token or pool is deployed and no ETH is supplied at deployment."
+}
