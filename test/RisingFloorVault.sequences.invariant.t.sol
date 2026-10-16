@@ -2,6 +2,8 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {RisingFloorVault} from "../src/RisingFloorVault.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
@@ -28,8 +30,10 @@ contract SequenceHandler is Test {
     uint256 public tokensRedeemed; // base units bought back
     uint256 public inventoryIn; // deposited
     uint256 public inventoryOut; // withdrawn by the owner
-    uint256 public floorHighWater; // highest floor seen while supply was outstanding
+    uint256 public floorHighWater; // highest floor seen in the current epoch; 0 between epochs
     uint256 public epochs; // full redemptions seen
+    uint256 public openingSold; // highest opening price an epoch has actually opened at
+    uint256 public strandedEth; // ETH forced in while nothing was outstanding, until the next epoch opens
 
     // Coverage counters so a run that only hit probes is visible.
     uint256 public buys;
@@ -60,10 +64,21 @@ contract SequenceHandler is Test {
         return actors[seed % actors.length];
     }
 
+    /// @dev The floor is monotone within an epoch. A full redemption pays everyone out and the next
+    ///      epoch opens at the owner's opening price, so the high-water mark resets with it.
     function _recordFloor() internal {
-        if (vault.backedSupply() == 0) return;
+        if (vault.backedSupply() == 0) {
+            floorHighWater = 0;
+            return;
+        }
         uint256 f = vault.floorPrice();
         if (f > floorHighWater) floorHighWater = f;
+    }
+
+    function _credits() internal view returns (uint256 total) {
+        for (uint256 i; i < actors.length; ++i) {
+            total += vault.redeemable(actors[i]);
+        }
     }
 
     // ------------------------------------------------------------------ public actions
@@ -100,14 +115,26 @@ contract SequenceHandler is Test {
         uint256 floorBefore = vault.floorPrice();
         uint256 supplyBefore = vault.backedSupply();
         uint256 reserveBefore = vault.reserve();
+        uint256 creditBefore = vault.redeemable(who);
+        uint256 minBefore = vault.minOpeningPrice();
+        uint256 opening = vault.openingPrice();
         vm.prank(who);
         uint256 out = vault.buy{value: amount}(quote);
 
         assertEq(out, quote, "buy: output differs from quote");
         assertEq(vault.reserve(), reserveBefore + amount, "buy: reserve");
         assertEq(vault.backedSupply(), supplyBefore + out, "buy: supply");
+        assertEq(vault.redeemable(who), creditBefore + out, "buy: credit");
         assertGe(vault.floorPrice(), floorBefore, "buy: floor fell");
         assertGe(amount.mulDiv(1e18, out), floorBefore, "buy: paid under the floor");
+        if (supplyBefore == 0) {
+            // The epoch opened at the opening price and the ratchet records exactly that.
+            assertEq(vault.minOpeningPrice(), Math.max(minBefore, opening), "buy: ratchet");
+            if (opening > openingSold) openingSold = opening;
+            strandedEth = 0;
+        } else {
+            assertEq(vault.minOpeningPrice(), minBefore, "buy: ratchet moved mid-epoch");
+        }
 
         ethIn += amount;
         tokensSold += out;
@@ -118,45 +145,65 @@ contract SequenceHandler is Test {
     function sell(uint256 seed, uint256 amount) external {
         address who = _actor(seed);
         uint256 balance = token.balanceOf(who);
-        if (balance == 0) {
-            // A holder of nothing cannot redeem anything, within the backed supply or not.
+        uint256 credit = vault.redeemable(who);
+        if (balance == 0 && credit == 0) {
+            // A holder of nothing cannot redeem anything, however small.
             probes++;
-            vm.prank(who);
+            vm.startPrank(who);
             vm.expectRevert(RisingFloorVault.ZeroAmount.selector);
             vault.sell(0, 0);
+            vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, 0, 1));
+            vault.sell(1, 0);
+            vm.stopPrank();
             return;
         }
-        amount = bound(amount, 1, balance);
+        // Up to whichever is larger, so both "credit without tokens" and "tokens without credit"
+        // are reached and asserted to fail.
+        amount = bound(amount, 1, Math.max(balance, credit));
         _redeem(who, amount);
     }
 
-    /// @dev Redeems everything a holder can: the whole balance, capped at the backed supply. This is
-    ///      the path that empties the vault and exercises the opening-price ratchet.
+    /// @dev Redeems everything a holder can: the whole credit, capped at the tokens in hand. This is
+    ///      the path that empties the vault and closes an epoch.
     function sellAll(uint256 seed) external {
         address who = _actor(seed);
-        uint256 amount = Math.min(token.balanceOf(who), vault.backedSupply());
+        uint256 amount = Math.min(token.balanceOf(who), vault.redeemable(who));
         if (amount == 0) return;
         _redeem(who, amount);
     }
 
     function _redeem(address who, uint256 amount) internal {
         uint256 supply = vault.backedSupply();
+        uint256 credit = vault.redeemable(who);
+        uint256 balance = token.balanceOf(who);
         vm.prank(who);
         token.approve(address(vault), amount);
 
-        if (amount > supply) {
+        if (amount > credit) {
             probes++;
             vm.prank(who);
-            vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsBackedSupply.selector, supply, amount));
+            vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, credit, amount));
             vault.sell(amount, 0);
             return;
         }
-        uint256 quote = vault.quoteSell(amount);
+        uint256 quote = vault.quoteSellFor(who, amount);
         if (quote == 0) {
             probes++;
             vm.prank(who);
             vm.expectRevert(RisingFloorVault.ZeroOutput.selector);
             vault.sell(amount, 0);
+            return;
+        }
+        if (amount > balance) {
+            // Credit without the tokens: the pull fails after every check passed, and nothing moved.
+            probes++;
+            vm.prank(who);
+            vm.expectRevert(
+                abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, who, balance, amount)
+            );
+            vault.sell(amount, 0);
+            assertEq(vault.redeemable(who), credit, "sell: failed pull changed the credit");
+            assertEq(vault.backedSupply(), supply, "sell: failed pull changed the supply");
             return;
         }
 
@@ -170,13 +217,17 @@ contract SequenceHandler is Test {
         assertEq(who.balance, whoBefore + out, "sell: payout");
         assertEq(vault.reserve(), reserveBefore - out, "sell: reserve");
         assertEq(vault.backedSupply(), supply - amount, "sell: supply");
+        assertEq(vault.redeemable(who), credit - amount, "sell: credit");
         // At or below the exact floor (reserve / supply), not the rounded view of it.
         assertLe(out, amount.mulDiv(reserveBefore, supply), "sell: paid over the floor");
-        assertGe(vault.floorPrice(), floorBefore, "sell: floor fell");
         if (vault.backedSupply() == 0) {
             epochs++;
-            assertGe(vault.minOpeningPrice(), floorBefore, "sell: ratchet below last floor");
+            assertEq(out, reserveBefore, "sell: the last holder is paid the whole reserve");
+            assertEq(vault.reserve(), 0, "sell: ETH left behind with nobody to own it");
             assertEq(vault.floorPrice(), vault.openingPrice(), "sell: empty vault quotes the opening price");
+            assertEq(vault.bidPrice(), 0, "sell: nothing to bid for");
+        } else {
+            assertGe(vault.floorPrice(), floorBefore, "sell: floor fell");
         }
 
         ethOut += out;
@@ -185,15 +236,48 @@ contract SequenceHandler is Test {
         _recordFloor();
     }
 
-    /// @dev Tokens move freely between holders; whoever holds them may redeem.
+    /// @dev Tokens move freely between holders; credit does not follow them.
     function transfer(uint256 fromSeed, uint256 toSeed, uint256 amount) external {
         address from = _actor(fromSeed);
         address to = _actor(toSeed >> 8);
         uint256 balance = token.balanceOf(from);
         if (balance == 0 || from == to) return;
         amount = bound(amount, 1, balance);
+        uint256 creditFrom = vault.redeemable(from);
+        uint256 creditTo = vault.redeemable(to);
         vm.prank(from);
         token.transfer(to, amount);
+        assertEq(vault.redeemable(from), creditFrom, "transfer: credit followed the tokens");
+        assertEq(vault.redeemable(to), creditTo, "transfer: credit followed the tokens");
+    }
+
+    /// @dev Credit moves on its own; tokens do not follow it.
+    function transferCredit(uint256 fromSeed, uint256 toSeed, uint256 amount) external {
+        address from = _actor(fromSeed);
+        address to = _actor(toSeed >> 8);
+        uint256 credit = vault.redeemable(from);
+        if (credit == 0) {
+            probes++;
+            vm.prank(from);
+            vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, 0, 1));
+            vault.transferRedeemable(to, 1);
+            return;
+        }
+        amount = bound(amount, 1, credit);
+        uint256 creditTo = vault.redeemable(to);
+        uint256 balanceFrom = token.balanceOf(from);
+        uint256 supply = vault.backedSupply();
+        vm.prank(from);
+        vault.transferRedeemable(to, amount);
+        if (from == to) {
+            assertEq(vault.redeemable(from), credit, "credit: self-transfer changed the credit");
+        } else {
+            assertEq(vault.redeemable(from), credit - amount, "credit: sender");
+            assertEq(vault.redeemable(to), creditTo + amount, "credit: recipient");
+        }
+        assertEq(token.balanceOf(from), balanceFrom, "credit: tokens moved");
+        assertEq(vault.backedSupply(), supply, "credit: supply moved");
+        assertEq(_credits(), supply, "credit: credits no longer sum to the supply");
     }
 
     function donate(uint256 seed, uint256 amount) external {
@@ -201,20 +285,35 @@ contract SequenceHandler is Test {
         amount = bound(amount, 1, 10 ether);
         vm.deal(who, who.balance + amount);
         uint256 floorBefore = vault.floorPrice();
+        uint256 reserveBefore = vault.reserve();
+        if (vault.backedSupply() == 0) {
+            // Nothing is outstanding: the ETH would belong to nobody, so it is refused.
+            probes++;
+            vm.prank(who);
+            (bool refused, bytes memory err) = address(vault).call{value: amount}("");
+            assertFalse(refused, "donate: accepted with nothing outstanding");
+            assertEq(bytes4(err), RisingFloorVault.NothingOutstanding.selector, "donate: wrong refusal");
+            assertEq(vault.reserve(), reserveBefore, "donate: refused but kept");
+            return;
+        }
         vm.prank(who);
         (bool ok,) = address(vault).call{value: amount}("");
         assertTrue(ok, "donation refused");
+        assertEq(vault.reserve(), reserveBefore + amount, "donate: reserve");
         assertGe(vault.floorPrice(), floorBefore, "donate: floor fell");
         ethIn += amount;
         _recordFloor();
     }
 
-    /// @dev ETH that arrives without a call (selfdestruct, block rewards) is reserve too.
+    /// @dev ETH that arrives without a call (selfdestruct, block rewards) cannot be refused. While
+    ///      something is outstanding it is reserve like any donation; between epochs it waits for
+    ///      the next buyer, whose tokens then open above the opening price.
     function forceEth(uint256 amount) external {
         amount = bound(amount, 1, 1 ether);
         uint256 floorBefore = vault.floorPrice();
         vm.deal(address(vault), address(vault).balance + amount);
         assertGe(vault.floorPrice(), floorBefore, "forced ETH: floor fell");
+        if (vault.backedSupply() == 0) strandedEth += amount;
         ethIn += amount;
         _recordFloor();
     }
@@ -253,6 +352,13 @@ contract SequenceHandler is Test {
         assertEq(vault.floorPrice(), floorBefore, "withdraw: floor moved");
         assertEq(vault.reserve(), reserveBefore, "withdraw: reserve moved");
         inventoryOut += amount;
+        // Withdrawn inventory carries no credit: the owner can never turn it into reserve ETH.
+        probes++;
+        vm.startPrank(owner);
+        token.approve(address(vault), amount);
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, 0, amount));
+        vault.sell(amount, 0);
+        vm.stopPrank();
     }
 
     function setSpreads(uint256 premium, uint256 fee) external {
@@ -278,13 +384,14 @@ contract SequenceHandler is Test {
         if (price < min) {
             probes++;
             vm.prank(owner);
-            vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.OpeningPriceBelowFloor.selector, price, min));
+            vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.OpeningPriceBelowMinimum.selector, price, min));
             vault.setOpeningPrice(price);
             return;
         }
         vm.prank(owner);
         vault.setOpeningPrice(price);
         assertEq(vault.openingPrice(), price);
+        assertEq(vault.minOpeningPrice(), min, "setting a price must not move the ratchet; selling at it does");
         assertEq(vault.floorPrice(), price, "empty vault quotes the opening price");
     }
 
@@ -311,37 +418,48 @@ contract SequenceHandler is Test {
         vault.withdrawInventory(who, 1);
         vm.expectRevert();
         vault.setToken(who);
+        vm.expectRevert();
+        vault.rescueERC20(IERC20(address(token)), who, 1);
+        vm.expectRevert();
+        vault.transferOwnership(who);
+        vm.expectRevert();
+        vault.renounceOwnership();
         vm.stopPrank();
     }
 
     /// @dev The slot is filled: nobody, not even the owner, can change the token any more.
     function probeTokenSlotIsFrozen() external {
         probes++;
-        vm.prank(owner);
+        vm.startPrank(owner);
         vm.expectRevert(RisingFloorVault.TokenAlreadySet.selector);
+        vault.setToken(address(token));
+        vm.expectRevert(RisingFloorVault.TokenAlreadySet.selector);
+        vault.setToken(address(vault));
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.NotAContract.selector, address(0xBEEF)));
         vault.setToken(address(0xBEEF));
-        vm.prank(owner);
         vm.expectRevert(RisingFloorVault.ZeroAddress.selector);
         vault.setToken(address(0));
+        vm.stopPrank();
     }
 
-    /// @dev Redeeming one unit past the backed supply always fails, however many tokens exist.
+    /// @dev Redeeming one unit past the credit always fails, however many tokens the caller holds.
     function probeOverRedemptionAlwaysFails(uint256 seed) external {
         address who = _actor(seed);
-        uint256 supply = vault.backedSupply();
+        uint256 credit = vault.redeemable(who);
+        uint256 extra = credit + 1;
         probes++;
-        token.mint(who, supply + 1);
+        token.mint(who, extra);
         vm.startPrank(who);
-        token.approve(address(vault), supply + 1);
-        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsBackedSupply.selector, supply, supply + 1));
-        vault.sell(supply + 1, 0);
+        token.approve(address(vault), extra);
+        vm.expectRevert(abi.encodeWithSelector(RisingFloorVault.ExceedsRedeemable.selector, credit, extra));
+        vault.sell(extra, 0);
         vm.stopPrank();
         // The probe's unbacked tokens become inventory, so actors stay the only holders outside the vault.
         vm.prank(who);
-        token.transfer(address(this), supply + 1);
-        token.approve(address(vault), supply + 1);
-        vault.depositInventory(supply + 1);
-        inventoryIn += supply + 1;
+        token.transfer(address(this), extra);
+        token.approve(address(vault), extra);
+        vault.depositInventory(extra);
+        inventoryIn += extra;
     }
 }
 
@@ -377,12 +495,13 @@ contract RisingFloorVaultSequencesInvariantTest is Test {
         vm.stopPrank();
 
         targetContract(address(handler));
-        bytes4[] memory selectors = new bytes4[](16);
+        bytes4[] memory selectors = new bytes4[](17);
         selectors[0] = SequenceHandler.buy.selector;
         selectors[1] = SequenceHandler.buy.selector; // weighted: buys and sells are the core
         selectors[2] = SequenceHandler.sell.selector;
         selectors[3] = SequenceHandler.sell.selector;
         selectors[15] = SequenceHandler.sellAll.selector;
+        selectors[16] = SequenceHandler.transferCredit.selector;
         selectors[4] = SequenceHandler.transfer.selector;
         selectors[5] = SequenceHandler.donate.selector;
         selectors[6] = SequenceHandler.forceEth.selector;
@@ -403,25 +522,30 @@ contract RisingFloorVaultSequencesInvariantTest is Test {
         }
     }
 
-    /// @dev The headline guarantee. While tokens are outstanding the floor is monotone; once they
-    ///      are all redeemed the vault reopens at or above the highest floor it reached, and the
-    ///      owner cannot set it lower.
+    /// @dev The headline guarantee. While tokens are outstanding the floor is monotone within the
+    ///      epoch; the opening price never goes below one the vault has sold at, and only sales
+    ///      move that minimum.
     function invariant_floorNeverFallsBelowItsHighWater() public view {
-        assertGe(vault.floorPrice(), handler.floorHighWater());
+        if (vault.backedSupply() != 0) {
+            assertGe(vault.floorPrice(), handler.floorHighWater());
+            assertGe(vault.floorPrice(), vault.minOpeningPrice(), "a live epoch is below the price it opened at");
+        }
         assertGe(vault.openingPrice(), vault.minOpeningPrice());
         assertGt(vault.openingPrice(), 0);
-        // Between epochs the reopen minimum is the best floor any past holder was ever quoted.
-        if (vault.backedSupply() == 0 && handler.epochs() > 0) {
-            assertGe(vault.minOpeningPrice(), handler.floorHighWater());
-        }
+        assertEq(vault.minOpeningPrice(), handler.openingSold(), "the ratchet is exactly the best opening sold at");
+        assertLe(vault.minOpeningPrice(), vault.openingPrice());
     }
 
     /// @dev ETH only enters through buys, donations or force, and only leaves through redemptions.
+    ///      Between epochs the reserve is empty but for ETH that was forced in without a call.
     function invariant_ethIsConserved() public view {
         assertEq(vault.reserve(), handler.ethIn() - handler.ethOut());
         assertLe(handler.ethOut(), handler.ethIn());
         assertEq(OWNER.balance, 0, "the owner has no path to the reserve");
         assertEq(address(handler).balance, 0);
+        if (vault.backedSupply() == 0) {
+            assertEq(vault.reserve(), handler.strandedEth(), "ETH left behind that nobody can redeem");
+        }
     }
 
     /// @dev Every token outside the vault was sold by it and is what `backedSupply` counts; the rest
@@ -436,17 +560,37 @@ contract RisingFloorVaultSequencesInvariantTest is Test {
         assertEq(token.balanceOf(address(vault)) + outside + token.balanceOf(OWNER), token.totalSupply());
     }
 
-    /// @dev The reserve can pay every holder at the quoted bid, and is never empty while anyone is owed.
+    /// @dev Redemption credit is conserved: it always sums to the backed supply, and only the actors
+    ///      who bought ever hold any.
+    function invariant_creditsSumToTheBackedSupply() public view {
+        uint256 credits;
+        for (uint256 i; i < handler.actorCount(); ++i) {
+            credits += vault.redeemable(handler.actor(i));
+        }
+        assertEq(credits, vault.backedSupply());
+        assertEq(vault.redeemable(OWNER), 0, "withdrawn inventory earned the owner credit");
+        assertEq(vault.redeemable(address(handler)), 0, "deposits earned credit");
+        assertEq(vault.redeemable(address(vault)), 0);
+    }
+
+    /// @dev The reserve can pay every credit holder, is never empty while anyone is owed, and the
+    ///      holder of all the credit is owed all of it.
     function invariant_reserveIsSolvent() public view {
         uint256 supply = vault.backedSupply();
         if (supply == 0) return;
-        assertGt(vault.reserve(), 0);
-        assertLe(vault.quoteSell(supply), vault.reserve());
+        uint256 reserve = vault.reserve();
+        assertGt(reserve, 0);
         uint256 owed;
         for (uint256 i; i < handler.actorCount(); ++i) {
-            owed += vault.quoteSell(token.balanceOf(handler.actor(i)));
+            address who = handler.actor(i);
+            uint256 credit = vault.redeemable(who);
+            uint256 quote = vault.quoteSellFor(who, credit);
+            assertLe(quote, reserve);
+            if (credit == supply) assertEq(quote, reserve);
+            else assertLe(quote, credit.mulDiv(reserve, supply), "a partial redemption pays over the floor");
+            owed += quote;
         }
-        assertLe(owed, vault.reserve());
+        assertLe(owed, reserve);
     }
 
     /// @dev bid <= floor <= ask, with the spreads inside their caps; an empty vault quotes the opening
@@ -459,6 +603,7 @@ contract RisingFloorVaultSequencesInvariantTest is Test {
         if (vault.backedSupply() == 0) {
             assertEq(vault.floorPrice(), vault.openingPrice());
             assertEq(vault.askPrice(), vault.openingPrice());
+            assertEq(vault.bidPrice(), 0);
         }
     }
 
