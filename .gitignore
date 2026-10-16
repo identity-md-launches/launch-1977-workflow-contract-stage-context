@@ -1,0 +1,11 @@
+# Foundry build output
+out/
+cache/
+broadcast/
+
+# Scratch space used while developing; never part of the deliverable
+test/scratch/
+
+# Never commit secrets
+.env
+.env.*
