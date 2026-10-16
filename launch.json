@@ -1,0 +1,10 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "RisingFloorVault",
+      "constructorArgs": ["0xd3f26a6be348440110161dfd5748e7de7b08cf69"]
+    }
+  ],
+  "notes": "Deploys the accepted RisingFloorVault with ownership assigned to the creator wallet 0xd3f26a6be348440110161dfd5748e7de7b08cf69, the owner the approved brief states explicitly, written as a static address so the result does not depend on which wallet paid for the launch. The factory receives no owner privileges. The token slot starts unset and can be set once by the owner using setToken(address). Purchases require the owner to set the token, opening price and spreads, and require available token inventory. These are application operations, not deployment calls in this manifest. Ownership transfers are two-step (Ownable2Step) and cannot be renounced before the token is set. The owner may pause new sales, withdraw unsold inventory, rescue unrelated ERC-20s and force-redeem holders at their full floor value into an escrow only they can withdraw; the owner cannot withdraw reserve ETH and redemptions are never pausable. The vault manages an ETH-backed redemption floor for tokens it sells; it does not guarantee an external market price. No token or pool is deployed and no ETH is supplied at deployment."
+}
